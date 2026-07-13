@@ -1,11 +1,26 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
+# Secrets - never commit
 .env
+scraper/cookies.txt
+ 
+# Knowledge base content - includes gated internal docs, regeneratable via scraper scripts
+knowledge-base/
+ 
+# Python
+__pycache__/
+*.pyc
+.venv/
+ 
+# Scraper intermediate output (regeneratable via scraper/scrape_kb.py)
+scraper/output/
+scraper/output-internal/
+scraper/*.html
+scraper/scrape_log.txt
+ 
+# Vector stores (regeneratable via ingest scripts)
+vector_db/
+preprocessed_db/
+ 
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+ 
