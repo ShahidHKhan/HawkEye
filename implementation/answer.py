@@ -1,9 +1,9 @@
 from pathlib import Path
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from chromadb import PersistentClient
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
-from pydantic import BaseModel, Field
 from tenacity import retry, wait_exponential, stop_after_attempt
 
 load_dotenv(override=True)
@@ -52,6 +52,34 @@ class RankOrder(BaseModel):
     order: list[int] = Field(
         description="The order of relevance of chunks, from most relevant to least relevant, by chunk id number"
     )
+
+
+class SubQuestions(BaseModel):
+    sub_questions: list[str] = Field(
+        description="One or more self-contained sub-questions. If the original question "
+                    "only has a single distinct ask, return a list containing just that "
+                    "question, unchanged."
+    )
+
+
+@retry(wait=wait, stop=stop_after_attempt(5))
+def decompose_question(question: str) -> list[str]:
+    """Split a compound question into self-contained sub-questions, if needed."""
+    system_prompt = """
+You help an IT help desk search system prepare a technician's question for retrieval.
+Determine whether the question contains more than one distinct, unrelated ask
+(e.g. two separate topics or tasks bundled into one sentence).
+
+If there is only one ask, return a list containing the original question, unchanged.
+If there are multiple distinct asks, split it into separate, self-contained sub-questions
+— each one should make sense on its own, without needing the rest of the sentence.
+Do not split a single ask into smaller pieces just because it's detailed or has multiple steps.
+"""
+    structured_llm = llm.with_structured_output(SubQuestions)
+    reply = structured_llm.invoke(
+        [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
+    )
+    return reply.sub_questions
 
 
 @retry(wait=wait, stop=stop_after_attempt(5))
@@ -124,13 +152,19 @@ Include every chunk id you are given, reranked — don't drop any.
 
 def fetch_context(question: str, history: list[dict] = []) -> list[Result]:
     """
-    Full pro retrieval: rewrite query, dual retrieval, merge, rerank, truncate to FINAL_K.
+    Full pro retrieval: decompose, rewrite+dual-retrieve per sub-question,
+    N-way merge, rerank against the original question, truncate to FINAL_K.
     """
-    rewritten = rewrite_query(question, history)
-    chunks_original = fetch_chunks(question)
-    chunks_rewritten = fetch_chunks(rewritten)
-    merged = merge_chunks(chunks_original, chunks_rewritten)
-    reranked = rerank(question, merged)
+    sub_questions = decompose_question(question)
+
+    all_chunks: list[Result] = []
+    for sub_q in sub_questions:
+        rewritten = rewrite_query(sub_q, history)
+        chunks_original = fetch_chunks(sub_q)
+        chunks_rewritten = fetch_chunks(rewritten)
+        all_chunks = merge_chunks(all_chunks, merge_chunks(chunks_original, chunks_rewritten))
+
+    reranked = rerank(question, all_chunks)
     return reranked[:FINAL_K]
 
 
