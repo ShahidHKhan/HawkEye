@@ -88,6 +88,7 @@ def main():
                     placeholder="e.g. customer can't connect to eduroam on their laptop",
                     show_label=False,
                 )
+                reset_button = gr.Button("New customer / reset chat", variant="secondary")
 
             with gr.Column(scale=1):
                 context_markdown = gr.Markdown(
@@ -109,6 +110,13 @@ def main():
         message.submit(
             put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]
         ).then(respond, inputs=chatbot, outputs=[chatbot, context_markdown])
+
+        def reset_chat():
+            return [], "*Retrieved context will appear here*", ""
+
+        reset_button.click(
+            reset_chat, inputs=None, outputs=[chatbot, context_markdown, message]
+        )
 
         def on_like(evt: gr.LikeData):
             # Gradio's LikeData gives us the message content and whether it was
