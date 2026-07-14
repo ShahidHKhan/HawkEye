@@ -5,13 +5,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from tenacity import retry, wait_exponential
-from langchain_chroma import Chroma
+from chromadb import PersistentClient
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 
 load_dotenv(override=True)
 
 MODEL = "gemini-2.5-flash-lite"
-DB_NAME = "vector_db"
+DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
+COLLECTION_NAME = "docs"
 OUTPUT_PATH = Path(__file__).parent / "spanning_draft.jsonl"
 
 TARGET_COUNT = 5       # how many spanning questions we want to end up with
@@ -20,9 +21,15 @@ NEIGHBORS_PER_SEED = 5
 
 wait = wait_exponential(multiplier=1, min=10, max=120)
 
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
-vectorstore = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
+embeddings_model = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+chroma = PersistentClient(path=DB_NAME)
+collection = chroma.get_or_create_collection(COLLECTION_NAME)
 llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0.3)
+
+
+class Result(BaseModel):
+    page_content: str
+    metadata: dict
 
 
 class SpanningCandidate(BaseModel):
@@ -78,9 +85,22 @@ def try_pair(text_a, source_a, text_b, source_b):
     return structured_llm.invoke(prompt)
 
 
-def load_all_chunks():
-    result = vectorstore._collection.get(include=["documents", "metadatas"])
-    return list(zip(result["documents"], result["metadatas"]))
+def load_all_chunks() -> list[Result]:
+    """Load every chunk from preprocessed_db (raw chromadb client, collection 'docs')."""
+    result = collection.get(include=["documents", "metadatas"])
+    return [
+        Result(page_content=doc, metadata=meta)
+        for doc, meta in zip(result["documents"], result["metadatas"])
+    ]
+
+
+def find_neighbors(query_text: str, k: int) -> list[Result]:
+    """Embed query_text and pull the k nearest chunks from preprocessed_db."""
+    query_embedding = embeddings_model.embed_query(query_text)
+    results = collection.query(query_embeddings=[query_embedding], n_results=k)
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+    return [Result(page_content=doc, metadata=meta) for doc, meta in zip(docs, metas)]
 
 
 def main():
@@ -91,18 +111,21 @@ def main():
     seed_sample = random.sample(all_chunks, min(MAX_ATTEMPTS, len(all_chunks)))
     found = []
 
-    for attempt, (doc, meta) in enumerate(seed_sample, start=1):
+    for attempt, chunk in enumerate(seed_sample, start=1):
         if len(found) >= TARGET_COUNT:
             break
 
-        neighbors = vectorstore.similarity_search(doc, k=NEIGHBORS_PER_SEED + 1)
-        candidates = [n for n in neighbors if n.metadata.get("source") != meta.get("source")]
+        neighbors = find_neighbors(chunk.page_content, NEIGHBORS_PER_SEED + 1)
+        candidates = [n for n in neighbors if n.metadata.get("source") != chunk.metadata.get("source")]
         if not candidates:
             continue
         neighbor = candidates[0]
 
-        print(f"[{attempt}] {meta.get('source')}  <->  {neighbor.metadata.get('source')}")
-        result = try_pair(doc, meta.get("source"), neighbor.page_content, neighbor.metadata.get("source"))
+        print(f"[{attempt}] {chunk.metadata.get('source')}  <->  {neighbor.metadata.get('source')}")
+        result = try_pair(
+            chunk.page_content, chunk.metadata.get("source"),
+            neighbor.page_content, neighbor.metadata.get("source"),
+        )
 
         if result.possible:
             found.append({
@@ -110,7 +133,7 @@ def main():
                 "keywords": result.keywords,
                 "reference_answer": result.reference_answer,
                 "category": "spanning",
-                "_sources": [meta.get("source"), neighbor.metadata.get("source")],
+                "_sources": [chunk.metadata.get("source"), neighbor.metadata.get("source")],
             })
             print("  -> spanning question found")
         else:
