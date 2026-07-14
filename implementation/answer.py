@@ -168,6 +168,7 @@ def fetch_context(question: str, history: list[dict] = []) -> list[Result]:
     return reranked[:FINAL_K]
 
 
+@retry(wait=wait, stop=stop_after_attempt(5))
 def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Result]]:
     """
     Answer the given question with pro RAG; return the answer and the context chunks.
