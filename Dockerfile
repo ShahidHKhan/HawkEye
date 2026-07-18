@@ -10,6 +10,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app.py ./
 COPY implementation ./implementation
+COPY static ./static
 
 RUN uv sync --frozen --no-dev
 
