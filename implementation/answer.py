@@ -189,12 +189,7 @@ def fetch_context(question: str, history: list[dict] = []) -> list[Result]:
     return reranked[:FINAL_K]
 
 
-@retry(wait=wait, stop=stop_after_attempt(5))
-def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Result]]:
-    """
-    Answer the given question with pro RAG; return the answer and the context chunks.
-    """
-    docs = fetch_context(question, history)
+def _build_messages(question: str, history: list[dict], docs: list[Result]) -> list:
     context = "\n\n".join(
         f"Source: {doc.metadata['source']}\n{doc.page_content}" for doc in docs
     )
@@ -202,5 +197,31 @@ def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[
     messages = [SystemMessage(content=system_prompt)]
     messages.extend(convert_to_messages(history))
     messages.append(HumanMessage(content=question))
+    return messages
+
+
+@retry(wait=wait, stop=stop_after_attempt(5))
+def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Result]]:
+    """
+    Answer the given question with pro RAG; return the answer and the context chunks.
+    """
+    docs = fetch_context(question, history)
+    messages = _build_messages(question, history, docs)
     response = llm.invoke(messages)
     return response.content, docs
+
+
+def answer_question_stream(question: str, history: list[dict] = []):
+    """
+    Same retrieval pipeline as answer_question, but yields (partial_answer, docs)
+    as the final generation streams in — docs is fixed after the first yield,
+    partial_answer accumulates token by token. Retrieval itself (decompose,
+    rewrite, dual-retrieve, rerank) still runs as one blocking step before the
+    first yield, since none of that is incremental.
+    """
+    docs = fetch_context(question, history)
+    messages = _build_messages(question, history, docs)
+    accumulated = ""
+    for chunk in llm.stream(messages):
+        accumulated += chunk.content
+        yield accumulated, docs
