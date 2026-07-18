@@ -1,21 +1,20 @@
-import json
+import argparse
+import os
 import re
 from multiprocessing import Pool
+from pathlib import Path
 
-from chromadb import PersistentClient
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from psycopg2.extras import execute_values
+from psycopg2.pool import SimpleConnectionPool
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
-from pathlib import Path
 
 load_dotenv(override=True)
 
 MODEL = "gemini-2.5-flash-lite"
-
-DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
-COLLECTION_NAME = "docs"
 EMBEDDING_MODEL = "gemini-embedding-001"
 KNOWLEDGE_BASE_PATH = Path(__file__).parent.parent / "knowledge-base"
 AVERAGE_CHUNK_SIZE = 500  # chars — tune later if chunks come out too big/small
@@ -24,6 +23,12 @@ WORKERS = 3  # keep low for Gemini rate limits
 EMBED_BATCH_SIZE = 50  # keep small to avoid rate limits
 
 BASE64_IMAGE_PATTERN = re.compile(r'!\[[^\]]*\]\(data:image/[^;]+;base64,[^)]+\)')
+
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+if not SUPABASE_DB_URL:
+    raise RuntimeError("SUPABASE_DB_URL not set — add it to your .env file")
+
+db_pool = SimpleConnectionPool(1, 5, SUPABASE_DB_URL)
 
 
 class Result(BaseModel):
@@ -135,6 +140,12 @@ def load_chunks_cache(path: str = "chunks_cache.jsonl") -> list[Result]:
     return chunks
 
 
+def save_chunks_cache(chunks: list[Result], path: str = "chunks_cache.jsonl") -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for chunk in chunks:
+            f.write(chunk.model_dump_json() + "\n")
+
+
 embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 
 
@@ -143,40 +154,127 @@ def embed_batch(texts: list[str]) -> list[list[float]]:
     return embeddings_model.embed_documents(texts)
 
 
+def embedding_to_vector_literal(embedding: list[float]) -> str:
+    """Format a python float list as a pgvector text literal, e.g. '[0.1,0.2,...]'."""
+    return "[" + ",".join(str(x) for x in embedding) + "]"
+
+
+def get_existing_chunk_keys() -> set[tuple[str, str]]:
+    """
+    (source, page_content) pairs already in Supabase — lets a partial ingest resume
+    without re-embedding chunks that already made it in. Keyed on content rather than
+    a positional index, since a bigserial primary key doesn't map to a batch offset
+    the way Chroma's manually-assigned string ids used to.
+    """
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT source, page_content FROM chunks")
+            return set(cur.fetchall())
+    finally:
+        db_pool.putconn(conn)
+
+
 def create_embeddings(chunks: list[Result], reset: bool = False) -> None:
-    chroma = PersistentClient(path=DB_NAME)
-    if reset and COLLECTION_NAME in [c.name for c in chroma.list_collections()]:
-        chroma.delete_collection(COLLECTION_NAME)
-    collection = chroma.get_or_create_collection(COLLECTION_NAME)
+    if reset:
+        conn = db_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE chunks")
+            conn.commit()
+        finally:
+            db_pool.putconn(conn)
 
-    existing_ids = set(collection.get(include=[])["ids"])
-    print(f"{len(existing_ids)} chunks already embedded, resuming...")
+    existing_keys = get_existing_chunk_keys()
+    print(f"{len(existing_keys)} chunks already embedded, resuming...")
 
-    for start in tqdm(range(0, len(chunks), EMBED_BATCH_SIZE)):
-        batch = chunks[start:start + EMBED_BATCH_SIZE]
-        ids = [str(start + i) for i in range(len(batch))]
-        # skip ids already done (lets us resume after a failure)
-        todo = [(i, c) for i, c in zip(ids, batch) if i not in existing_ids]
-        if not todo:
-            continue
-        todo_ids = [i for i, c in todo]
-        todo_chunks = [c for i, c in todo]
-        texts = [c.page_content for c in todo_chunks]
+    todo = [c for c in chunks if (c.metadata["source"], c.page_content) not in existing_keys]
+
+    for start in tqdm(range(0, len(todo), EMBED_BATCH_SIZE)):
+        batch = todo[start:start + EMBED_BATCH_SIZE]
+        texts = [c.page_content for c in batch]
         vectors = embed_batch(texts)
-        metas = [c.metadata for c in todo_chunks]
-        collection.add(ids=todo_ids, embeddings=vectors, documents=texts, metadatas=metas)
+        rows = [
+            (c.metadata["source"], c.metadata.get("type"), c.page_content, embedding_to_vector_literal(v))
+            for c, v in zip(batch, vectors)
+        ]
+        conn = db_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    "INSERT INTO chunks (source, type, page_content, embedding) VALUES %s",
+                    rows,
+                    template="(%s, %s, %s, %s::vector)",
+                )
+            conn.commit()
+        finally:
+            db_pool.putconn(conn)
 
-    print(f"Vectorstore created with {collection.count()} documents")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM chunks")
+            total = cur.fetchone()[0]
+    finally:
+        db_pool.putconn(conn)
+    print(f"chunks table now has {total:,} rows")
+
+
+def run_ingest(reset: bool = False, regenerate: bool = False, cache_path: str = "chunks_cache.jsonl") -> None:
+    if regenerate or not Path(cache_path).exists():
+        documents = fetch_documents()
+        chunks = create_chunks(documents)
+        save_chunks_cache(chunks, cache_path)
+    else:
+        print(f"Loading chunks from cache: {cache_path}")
+        chunks = load_chunks_cache(cache_path)
+    print(f"{len(chunks)} chunks ready to embed")
+    create_embeddings(chunks, reset=reset)
+
+
+def smoke_test() -> None:
+    """Sanity-check retrieval against whatever is already in the chunks table."""
+    query_embedding = embeddings_model.embed_query("How do I reset my password?")
+    embedding_literal = embedding_to_vector_literal(query_embedding)
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source, page_content
+                FROM chunks
+                ORDER BY embedding <-> %s::vector
+                LIMIT 3
+                """,
+                (embedding_literal,),
+            )
+            rows = cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+
+    for source, page_content in rows:
+        print("---")
+        print(page_content[:300])
+        print("source:", source)
 
 
 if __name__ == "__main__":
-    chroma = PersistentClient(path=DB_NAME)
-    collection = chroma.get_or_create_collection(COLLECTION_NAME)
+    parser = argparse.ArgumentParser(description="Ingest knowledge-base/ into the Supabase chunks table")
+    parser.add_argument("--reset", action="store_true", help="Truncate the chunks table before ingesting")
+    parser.add_argument(
+        "--regenerate", action="store_true",
+        help="Re-chunk knowledge-base/ via the LLM instead of loading the cache",
+    )
+    parser.add_argument("--cache-path", default="chunks_cache.jsonl", help="Path to the chunk cache file")
+    parser.add_argument(
+        "--smoke-test", action="store_true",
+        help="Skip ingestion; just run a sample similarity query against the existing table",
+    )
+    args = parser.parse_args()
 
-    query_embedding = embeddings_model.embed_query("How do I reset my password?")
-    results = collection.query(query_embeddings=[query_embedding], n_results=3)
-
-    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-        print("---")
-        print(doc[:300])
-        print("source:", meta["source"])
+    if args.smoke_test:
+        smoke_test()
+    else:
+        run_ingest(reset=args.reset, regenerate=args.regenerate, cache_path=args.cache_path)

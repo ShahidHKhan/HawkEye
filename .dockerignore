@@ -1,0 +1,17 @@
+.git
+.venv
+.vscode
+__pycache__/
+*.pyc
+.env
+.python-version
+
+*.ipynb
+evaluation/
+evaluator.py
+rag_build_guide.md
+scraper/
+knowledge-base/
+vector_db/
+preprocessed_db/
+chunks_cache.jsonl
