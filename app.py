@@ -1,10 +1,14 @@
+import os
 import time
 
 import gradio as gr
 from dotenv import load_dotenv
 from psycopg2.extras import Json
 
-from implementation.answer import answer_question, db_pool
+from implementation.answer import answer_question_stream, db_pool
+
+ASSISTANT_AVATAR = "static/hawkeye-icon.svg"
+FAVICON = "static/hawkeye-icon.svg"
 
 load_dotenv(override=True)
 
@@ -67,28 +71,41 @@ def log_feedback(answer: str, liked: bool) -> None:
         db_pool.putconn(conn)
 
 
+def clean_source(source: str) -> str:
+    """Show a clean relative path instead of a local absolute file path."""
+    normalized = source.replace("\\", "/")
+    marker = "knowledge-base/"
+    idx = normalized.lower().find(marker)
+    if idx != -1:
+        return normalized[idx + len(marker):]
+    return normalized.split("/")[-1]
+
+
 def format_context(chunks) -> str:
     if not chunks:
         return "*No sources retrieved.*"
     result = "### Retrieved sources\n\n"
     for chunk in chunks:
-        result += f"**Source:** {chunk.metadata.get('source', 'unknown')}\n\n"
+        result += f"**Source:** {clean_source(chunk.metadata.get('source', 'unknown'))}\n\n"
         result += chunk.page_content + "\n\n---\n\n"
     return result
 
 
-def chat(message: str, history: list[dict]) -> tuple[str, str]:
+def chat_stream(message: str, history: list[dict]):
     """
-    Call the real production pipeline; log every attempt (success or failure);
-    never let a raw exception reach the technician's screen.
+    Streaming version of the production pipeline: yields (partial_answer, context)
+    as the answer streams in. Logs exactly once, after the stream finishes
+    (success or failure); never lets a raw exception reach the technician's screen.
     """
     start = time.time()
+    docs = []
+    answer = ""
     try:
-        answer, chunks = answer_question(message, history)
-        sources = [chunk.metadata.get("source") for chunk in chunks]
+        for answer, docs in answer_question_stream(message, history):
+            yield answer, format_context(docs)
         latency = time.time() - start
+        sources = [chunk.metadata.get("source") for chunk in docs]
         log_query(message, history, answer, sources, latency, error=None)
-        return answer, format_context(chunks)
     except Exception as e:
         latency = time.time() - start
         log_query(message, history, None, None, latency, error=str(e))
@@ -96,10 +113,14 @@ def chat(message: str, history: list[dict]) -> tuple[str, str]:
             "Something went wrong reaching the knowledge base or the model just now. "
             "Try again in a moment — this has been logged."
         )
-        return friendly, "*Error retrieving context — this attempt has been logged.*"
+        yield friendly, "*Error retrieving context — this attempt has been logged.*"
 
 
 def main():
+    theme = gr.themes.Soft(
+        primary_hue="blue", secondary_hue="slate", font=["Inter", "system-ui", "sans-serif"]
+    )
+
     with gr.Blocks(title="HawkEye IT Assistant") as ui:
         gr.Markdown(
             "# HawkEye\nInternal IT help desk knowledge assistant — technicians only. "
@@ -108,20 +129,28 @@ def main():
 
         with gr.Row():
             with gr.Column(scale=1):
-                chatbot = gr.Chatbot(label="Conversation", height=600)
-                message = gr.Textbox(
-                    label="Question",
-                    placeholder="e.g. customer can't connect to eduroam on their laptop",
-                    show_label=False,
+                chatbot = gr.Chatbot(
+                    label="Conversation",
+                    height=420,
+                    avatar_images=(None, ASSISTANT_AVATAR),
+                    buttons=["copy", "copy_all"],
                 )
-                reset_button = gr.Button("New customer / reset chat", variant="secondary")
+                with gr.Row():
+                    message = gr.Textbox(
+                        label="Question",
+                        placeholder="e.g. customer can't connect to eduroam on their laptop",
+                        show_label=False,
+                        scale=5,
+                    )
+                    send_button = gr.Button("Send", variant="primary", scale=1)
 
             with gr.Column(scale=1):
                 context_markdown = gr.Markdown(
                     value="*Retrieved context will appear here*",
                     container=True,
-                    height=600,
+                    height=420,
                 )
+                reset_button = gr.Button("New customer / reset chat", variant="secondary")
 
         def put_message_in_chatbot(msg, hist):
             return "", hist + [{"role": "user", "content": msg}]
@@ -130,11 +159,17 @@ def main():
             hist = normalize_history(hist)
             last_message = hist[-1]["content"]
             prior = hist[:-1]
-            answer, context = chat(last_message, prior)
-            hist.append({"role": "assistant", "content": answer})
-            return hist, context
+            hist.append({"role": "assistant", "content": "_Searching the knowledge base…_"})
+            yield hist, "*Retrieving context…*"
+            for partial_answer, context in chat_stream(last_message, prior):
+                hist[-1]["content"] = partial_answer
+                yield hist, context
 
         message.submit(
+            put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]
+        ).then(respond, inputs=chatbot, outputs=[chatbot, context_markdown])
+
+        send_button.click(
             put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]
         ).then(respond, inputs=chatbot, outputs=[chatbot, context_markdown])
 
@@ -153,7 +188,13 @@ def main():
 
         chatbot.like(on_like)
 
-    ui.launch(inbrowser=True, theme=gr.themes.Soft(font=["Inter", "system-ui", "sans-serif"]))
+    ui.launch(
+        theme=theme,
+        auth=[(os.getenv("APP_USERNAME"), os.getenv("APP_PASSWORD"))],
+        server_name="0.0.0.0",
+        server_port=int(os.getenv("PORT", 7860)),
+        favicon_path=FAVICON,
+    )
 
 
 if __name__ == "__main__":

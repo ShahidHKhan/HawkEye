@@ -1,3 +1,4 @@
+import argparse
 import os
 import re
 from multiprocessing import Pool
@@ -139,6 +140,12 @@ def load_chunks_cache(path: str = "chunks_cache.jsonl") -> list[Result]:
     return chunks
 
 
+def save_chunks_cache(chunks: list[Result], path: str = "chunks_cache.jsonl") -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for chunk in chunks:
+            f.write(chunk.model_dump_json() + "\n")
+
+
 embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 
 
@@ -214,9 +221,20 @@ def create_embeddings(chunks: list[Result], reset: bool = False) -> None:
     print(f"chunks table now has {total:,} rows")
 
 
-if __name__ == "__main__":
-    # Smoke test only — same as before, this does not run full ingestion.
-    # Call fetch_documents() -> create_chunks() -> create_embeddings() manually to ingest.
+def run_ingest(reset: bool = False, regenerate: bool = False, cache_path: str = "chunks_cache.jsonl") -> None:
+    if regenerate or not Path(cache_path).exists():
+        documents = fetch_documents()
+        chunks = create_chunks(documents)
+        save_chunks_cache(chunks, cache_path)
+    else:
+        print(f"Loading chunks from cache: {cache_path}")
+        chunks = load_chunks_cache(cache_path)
+    print(f"{len(chunks)} chunks ready to embed")
+    create_embeddings(chunks, reset=reset)
+
+
+def smoke_test() -> None:
+    """Sanity-check retrieval against whatever is already in the chunks table."""
     query_embedding = embeddings_model.embed_query("How do I reset my password?")
     embedding_literal = embedding_to_vector_literal(query_embedding)
 
@@ -240,3 +258,23 @@ if __name__ == "__main__":
         print("---")
         print(page_content[:300])
         print("source:", source)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Ingest knowledge-base/ into the Supabase chunks table")
+    parser.add_argument("--reset", action="store_true", help="Truncate the chunks table before ingesting")
+    parser.add_argument(
+        "--regenerate", action="store_true",
+        help="Re-chunk knowledge-base/ via the LLM instead of loading the cache",
+    )
+    parser.add_argument("--cache-path", default="chunks_cache.jsonl", help="Path to the chunk cache file")
+    parser.add_argument(
+        "--smoke-test", action="store_true",
+        help="Skip ingestion; just run a sample similarity query against the existing table",
+    )
+    args = parser.parse_args()
+
+    if args.smoke_test:
+        smoke_test()
+    else:
+        run_ingest(reset=args.reset, regenerate=args.regenerate, cache_path=args.cache_path)

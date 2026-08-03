@@ -1,10 +1,11 @@
 import os
-from pydantic import BaseModel, Field
+
 from dotenv import load_dotenv
-from psycopg2.pool import SimpleConnectionPool
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
-from tenacity import retry, wait_exponential, stop_after_attempt
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from psycopg2.pool import SimpleConnectionPool
+from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv(override=True)
 
@@ -188,12 +189,7 @@ def fetch_context(question: str, history: list[dict] = []) -> list[Result]:
     return reranked[:FINAL_K]
 
 
-@retry(wait=wait, stop=stop_after_attempt(5))
-def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Result]]:
-    """
-    Answer the given question with pro RAG; return the answer and the context chunks.
-    """
-    docs = fetch_context(question, history)
+def _build_messages(question: str, history: list[dict], docs: list[Result]) -> list:
     context = "\n\n".join(
         f"Source: {doc.metadata['source']}\n{doc.page_content}" for doc in docs
     )
@@ -201,5 +197,31 @@ def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[
     messages = [SystemMessage(content=system_prompt)]
     messages.extend(convert_to_messages(history))
     messages.append(HumanMessage(content=question))
+    return messages
+
+
+@retry(wait=wait, stop=stop_after_attempt(5))
+def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Result]]:
+    """
+    Answer the given question with pro RAG; return the answer and the context chunks.
+    """
+    docs = fetch_context(question, history)
+    messages = _build_messages(question, history, docs)
     response = llm.invoke(messages)
     return response.content, docs
+
+
+def answer_question_stream(question: str, history: list[dict] = []):
+    """
+    Same retrieval pipeline as answer_question, but yields (partial_answer, docs)
+    as the final generation streams in — docs is fixed after the first yield,
+    partial_answer accumulates token by token. Retrieval itself (decompose,
+    rewrite, dual-retrieve, rerank) still runs as one blocking step before the
+    first yield, since none of that is incremental.
+    """
+    docs = fetch_context(question, history)
+    messages = _build_messages(question, history, docs)
+    accumulated = ""
+    for chunk in llm.stream(messages):
+        accumulated += chunk.content
+        yield accumulated, docs
