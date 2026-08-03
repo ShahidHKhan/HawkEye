@@ -1,7 +1,7 @@
-from pathlib import Path
+import os
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from chromadb import PersistentClient
+from psycopg2.pool import SimpleConnectionPool
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
 from tenacity import retry, wait_exponential, stop_after_attempt
@@ -9,8 +9,6 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 load_dotenv(override=True)
 
 MODEL = "gemini-2.5-flash-lite"
-DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
-COLLECTION_NAME = "docs"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
 RETRIEVAL_K = 10
@@ -18,9 +16,13 @@ FINAL_K = 5
 
 wait = wait_exponential(multiplier=1, min=10, max=240)
 
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+if not SUPABASE_DB_URL:
+    raise RuntimeError("SUPABASE_DB_URL not set — add it to your .env file")
+
+db_pool = SimpleConnectionPool(1, 5, SUPABASE_DB_URL)
+
 embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-chroma = PersistentClient(path=DB_NAME)
-collection = chroma.get_or_create_collection(COLLECTION_NAME)
 llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0)
 
 SYSTEM_PROMPT_TEMPLATE = """
@@ -109,12 +111,30 @@ IMPORTANT: Respond ONLY with the search query, nothing else.
 
 
 def fetch_chunks(query: str, k: int = RETRIEVAL_K) -> list[Result]:
-    """Embed a query and retrieve top-k chunks from the vector store."""
+    """Embed a query and retrieve the k nearest chunks from Supabase (pgvector)."""
     query_embedding = embeddings_model.embed_query(query)
-    results = collection.query(query_embeddings=[query_embedding], n_results=k)
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    return [Result(page_content=doc, metadata=meta) for doc, meta in zip(docs, metas)]
+    embedding_literal = "[" + ",".join(str(x) for x in query_embedding) + "]"
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source, type, page_content
+                FROM chunks
+                ORDER BY embedding <-> %s::vector
+                LIMIT %s
+                """,
+                (embedding_literal, k),
+            )
+            rows = cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+
+    return [
+        Result(page_content=page_content, metadata={"source": source, "type": doc_type})
+        for source, doc_type, page_content in rows
+    ]
 
 
 def merge_chunks(chunks_a: list[Result], chunks_b: list[Result]) -> list[Result]:

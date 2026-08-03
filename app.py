@@ -1,44 +1,70 @@
-import json
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 
 import gradio as gr
 from dotenv import load_dotenv
+from psycopg2.extras import Json
 
-from implementation.answer import answer_question
+from implementation.answer import answer_question, db_pool
 
 load_dotenv(override=True)
 
-LOG_DIR = Path(__file__).parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-QUERY_LOG = LOG_DIR / "queries.jsonl"
-FEEDBACK_LOG = LOG_DIR / "feedback.jsonl"
+
+def extract_text(content) -> str:
+    """
+    Gradio 6's Chatbot returns message content as either a plain string or a list
+    of content-part dicts (e.g. [{'type': 'text', 'text': '...'}]), even for
+    plain-text messages. Normalize to plain text so nothing downstream — the RAG
+    pipeline, query rewriting, or logging — has to special-case this.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
+
+
+def normalize_history(hist: list[dict]) -> list[dict]:
+    return [{"role": m["role"], "content": extract_text(m["content"])} for m in hist]
 
 
 def log_query(question: str, history: list[dict], answer: str | None,
               sources: list[str] | None, latency: float, error: str | None) -> None:
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "question": question,
-        "history_length": len(history),
-        "answer": answer,
-        "sources": sources,
-        "latency_seconds": round(latency, 2),
-        "error": error,
-    }
-    with open(QUERY_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO queries (question, history_length, answer, sources, latency_seconds, error)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    question,
+                    len(history),
+                    answer,
+                    Json(sources) if sources is not None else None,
+                    round(latency, 2),
+                    error,
+                ),
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
 
 
 def log_feedback(answer: str, liked: bool) -> None:
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "answer": answer,
-        "liked": liked,
-    }
-    with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO feedback (answer, liked) VALUES (%s, %s)",
+                (answer, liked),
+            )
+        conn.commit()
+    finally:
+        db_pool.putconn(conn)
 
 
 def format_context(chunks) -> str:
@@ -70,7 +96,7 @@ def chat(message: str, history: list[dict]) -> tuple[str, str]:
             "Something went wrong reaching the knowledge base or the model just now. "
             "Try again in a moment — this has been logged."
         )
-        return friendly, "*Error retrieving context — see logs/queries.jsonl.*"
+        return friendly, "*Error retrieving context — this attempt has been logged.*"
 
 
 def main():
@@ -101,6 +127,7 @@ def main():
             return "", hist + [{"role": "user", "content": msg}]
 
         def respond(hist):
+            hist = normalize_history(hist)
             last_message = hist[-1]["content"]
             prior = hist[:-1]
             answer, context = chat(last_message, prior)
