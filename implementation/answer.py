@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from psycopg2.pool import SimpleConnectionPool
+from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -21,7 +21,12 @@ SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 if not SUPABASE_DB_URL:
     raise RuntimeError("SUPABASE_DB_URL not set — add it to your .env file")
 
-db_pool = SimpleConnectionPool(1, 5, SUPABASE_DB_URL)
+db_pool = ConnectionPool(
+    SUPABASE_DB_URL,
+    min_size=1,
+    max_size=5,
+    check=ConnectionPool.check_connection,
+)
 
 embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0)
@@ -116,8 +121,7 @@ def fetch_chunks(query: str, k: int = RETRIEVAL_K) -> list[Result]:
     query_embedding = embeddings_model.embed_query(query)
     embedding_literal = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
-    conn = db_pool.getconn()
-    try:
+    with db_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -129,8 +133,6 @@ def fetch_chunks(query: str, k: int = RETRIEVAL_K) -> list[Result]:
                 (embedding_literal, k),
             )
             rows = cur.fetchall()
-    finally:
-        db_pool.putconn(conn)
 
     return [
         Result(page_content=page_content, metadata={"source": source, "type": doc_type})

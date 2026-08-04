@@ -6,8 +6,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from psycopg2.extras import execute_values
-from psycopg2.pool import SimpleConnectionPool
+from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
@@ -28,7 +27,12 @@ SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 if not SUPABASE_DB_URL:
     raise RuntimeError("SUPABASE_DB_URL not set — add it to your .env file")
 
-db_pool = SimpleConnectionPool(1, 5, SUPABASE_DB_URL)
+db_pool = ConnectionPool(
+    SUPABASE_DB_URL,
+    min_size=1,
+    max_size=5,
+    check=ConnectionPool.check_connection,
+)
 
 
 class Result(BaseModel):
@@ -166,24 +170,18 @@ def get_existing_chunk_keys() -> set[tuple[str, str]]:
     a positional index, since a bigserial primary key doesn't map to a batch offset
     the way Chroma's manually-assigned string ids used to.
     """
-    conn = db_pool.getconn()
-    try:
+    with db_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT source, page_content FROM chunks")
             return set(cur.fetchall())
-    finally:
-        db_pool.putconn(conn)
 
 
 def create_embeddings(chunks: list[Result], reset: bool = False) -> None:
     if reset:
-        conn = db_pool.getconn()
-        try:
+        with db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("TRUNCATE chunks")
             conn.commit()
-        finally:
-            db_pool.putconn(conn)
 
     existing_keys = get_existing_chunk_keys()
     print(f"{len(existing_keys)} chunks already embedded, resuming...")
@@ -198,26 +196,19 @@ def create_embeddings(chunks: list[Result], reset: bool = False) -> None:
             (c.metadata["source"], c.metadata.get("type"), c.page_content, embedding_to_vector_literal(v))
             for c, v in zip(batch, vectors)
         ]
-        conn = db_pool.getconn()
-        try:
+        with db_pool.connection() as conn:
             with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    "INSERT INTO chunks (source, type, page_content, embedding) VALUES %s",
+                cur.executemany(
+                    "INSERT INTO chunks (source, type, page_content, embedding) "
+                    "VALUES (%s, %s, %s, %s::vector)",
                     rows,
-                    template="(%s, %s, %s, %s::vector)",
                 )
             conn.commit()
-        finally:
-            db_pool.putconn(conn)
 
-    conn = db_pool.getconn()
-    try:
+    with db_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM chunks")
             total = cur.fetchone()[0]
-    finally:
-        db_pool.putconn(conn)
     print(f"chunks table now has {total:,} rows")
 
 
@@ -238,8 +229,7 @@ def smoke_test() -> None:
     query_embedding = embeddings_model.embed_query("How do I reset my password?")
     embedding_literal = embedding_to_vector_literal(query_embedding)
 
-    conn = db_pool.getconn()
-    try:
+    with db_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -251,8 +241,6 @@ def smoke_test() -> None:
                 (embedding_literal,),
             )
             rows = cur.fetchall()
-    finally:
-        db_pool.putconn(conn)
 
     for source, page_content in rows:
         print("---")

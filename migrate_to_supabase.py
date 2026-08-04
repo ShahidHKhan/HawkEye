@@ -1,8 +1,7 @@
 import os
 from pathlib import Path
 
-import psycopg2
-from psycopg2.extras import execute_values
+import psycopg
 from chromadb import PersistentClient
 from dotenv import load_dotenv
 
@@ -31,7 +30,7 @@ def embedding_to_vector_literal(embedding: list[float]) -> str:
 
 
 def main():
-    conn = psycopg2.connect(SUPABASE_DB_URL)
+    conn = psycopg.connect(SUPABASE_DB_URL)
     cur = conn.cursor()
 
     # Safety check: don't silently duplicate rows if this has already been run.
@@ -55,11 +54,10 @@ def main():
     inserted = 0
     for start in range(0, len(rows), BATCH_SIZE):
         batch = rows[start:start + BATCH_SIZE]
-        execute_values(
-            cur,
-            "INSERT INTO chunks (source, type, page_content, embedding) VALUES %s",
+        cur.executemany(
+            "INSERT INTO chunks (source, type, page_content, embedding) "
+            "VALUES (%s, %s, %s, %s::vector)",
             batch,
-            template="(%s, %s, %s, %s::vector)",
         )
         conn.commit()
         inserted += len(batch)

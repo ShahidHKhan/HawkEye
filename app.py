@@ -3,7 +3,7 @@ import time
 
 import gradio as gr
 from dotenv import load_dotenv
-from psycopg2.extras import Json
+from psycopg.types.json import Jsonb
 
 from implementation.answer import answer_question_stream, db_pool
 
@@ -36,8 +36,7 @@ def normalize_history(hist: list[dict]) -> list[dict]:
 
 def log_query(question: str, history: list[dict], answer: str | None,
               sources: list[str] | None, latency: float, error: str | None) -> None:
-    conn = db_pool.getconn()
-    try:
+    with db_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -48,27 +47,22 @@ def log_query(question: str, history: list[dict], answer: str | None,
                     question,
                     len(history),
                     answer,
-                    Json(sources) if sources is not None else None,
+                    Jsonb(sources) if sources is not None else None,
                     round(latency, 2),
                     error,
                 ),
             )
         conn.commit()
-    finally:
-        db_pool.putconn(conn)
 
 
 def log_feedback(answer: str, liked: bool) -> None:
-    conn = db_pool.getconn()
-    try:
+    with db_pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO feedback (answer, liked) VALUES (%s, %s)",
                 (answer, liked),
             )
         conn.commit()
-    finally:
-        db_pool.putconn(conn)
 
 
 def clean_source(source: str) -> str:
