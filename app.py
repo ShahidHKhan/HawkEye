@@ -85,6 +85,59 @@ def format_context(chunks) -> str:
     return result
 
 
+REFRESH_RUNS_HEADERS = [
+    "Started", "Finished", "Scope", "New", "Changed", "Unchanged", "Removed", "Status", "Error",
+]
+REFRESH_RUNS_DATATYPES = ["str", "str", "str", "number", "number", "number", "number", "str", "str"]
+
+
+def fetch_refresh_runs(limit: int = 20) -> list[tuple]:
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT started_at, finished_at, scope, new_count, changed_count,
+                       unchanged_count, removed_count, error
+                FROM refresh_runs
+                ORDER BY started_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
+def format_refresh_runs(rows: list[tuple]) -> list[list]:
+    formatted = []
+    for started_at, finished_at, scope, new, changed, unchanged, removed, error in rows:
+        if error:
+            status = "Failed"
+        elif finished_at is None:
+            status = "Running"
+        else:
+            status = "Success"
+        formatted.append([
+            started_at.strftime("%Y-%m-%d %H:%M UTC"),
+            finished_at.strftime("%Y-%m-%d %H:%M UTC") if finished_at else "—",
+            scope,
+            new,
+            changed,
+            unchanged,
+            removed,
+            status,
+            error or "",
+        ])
+    return formatted
+
+
+def load_refresh_runs():
+    """Read-only fetch of the most recent KB refresh runs; no writes to refresh_runs."""
+    rows = fetch_refresh_runs(20)
+    if not rows:
+        return gr.update(value=[]), "*No refresh runs recorded yet.*"
+    return gr.update(value=format_refresh_runs(rows)), ""
+
+
 def chat_stream(message: str, history: list[dict]):
     """
     Streaming version of the production pipeline: yields (partial_answer, context)
@@ -121,30 +174,52 @@ def main():
             "Describe the customer's issue as you would to a coworker."
         )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                chatbot = gr.Chatbot(
-                    label="Conversation",
-                    height=420,
-                    avatar_images=(None, ASSISTANT_AVATAR),
-                    buttons=["copy", "copy_all"],
-                )
+        with gr.Tabs():
+            with gr.Tab("Assistant"):
                 with gr.Row():
-                    message = gr.Textbox(
-                        label="Question",
-                        placeholder="e.g. customer can't connect to eduroam on their laptop",
-                        show_label=False,
-                        scale=5,
-                    )
-                    send_button = gr.Button("Send", variant="primary", scale=1)
+                    with gr.Column(scale=1):
+                        chatbot = gr.Chatbot(
+                            label="Conversation",
+                            height=420,
+                            avatar_images=(None, ASSISTANT_AVATAR),
+                            buttons=["copy", "copy_all"],
+                        )
+                        with gr.Row():
+                            message = gr.Textbox(
+                                label="Question",
+                                placeholder="e.g. customer can't connect to eduroam on their laptop",
+                                show_label=False,
+                                scale=5,
+                            )
+                            send_button = gr.Button("Send", variant="primary", scale=1)
 
-            with gr.Column(scale=1):
-                context_markdown = gr.Markdown(
-                    value="*Retrieved context will appear here*",
-                    container=True,
-                    height=420,
+                    with gr.Column(scale=1):
+                        context_markdown = gr.Markdown(
+                            value="*Retrieved context will appear here*",
+                            container=True,
+                            height=420,
+                        )
+                        reset_button = gr.Button("New customer / reset chat", variant="secondary")
+
+            with gr.Tab("Refresh History") as refresh_tab:
+                gr.Markdown(
+                    "Most recent knowledge-base refresh runs (weekly pipeline). Read-only."
                 )
-                reset_button = gr.Button("New customer / reset chat", variant="secondary")
+                refresh_runs_table = gr.Dataframe(
+                    headers=REFRESH_RUNS_HEADERS,
+                    datatype=REFRESH_RUNS_DATATYPES,
+                    interactive=False,
+                    wrap=True,
+                )
+                refresh_runs_empty = gr.Markdown(value="")
+                refresh_runs_button = gr.Button("Refresh", size="sm")
+
+            refresh_tab.select(
+                load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
+            )
+            refresh_runs_button.click(
+                load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
+            )
 
         def put_message_in_chatbot(msg, hist):
             return "", hist + [{"role": "user", "content": msg}]

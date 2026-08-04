@@ -17,10 +17,13 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 BASE_URL = "https://newpaltz.teamdynamix.com"
 OUTPUT_DIR = Path(__file__).parent / "output"
 REQUEST_DELAY = 0.6  # seconds between requests, be polite to their server
+
+wait = wait_exponential(multiplier=1, min=10, max=240)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -87,6 +90,7 @@ def crawl_category_tree(start_url: str):
     return all_article_urls
 
 
+@retry(wait=wait, stop=stop_after_attempt(5))
 def parse_article(url: str) -> dict:
     soup = fetch_soup(url)
 

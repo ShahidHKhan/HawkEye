@@ -26,10 +26,7 @@ def safe_filename(title: str, article_id: str) -> str:
     return f"{slug[:80]}-{article_id}.md"
 
 
-def convert_file(json_path: Path, category_dir: Path):
-    with open(json_path, "r", encoding="utf-8") as f:
-        article = json.load(f)
-
+def build_markdown_post(article: dict) -> frontmatter.Post:
     post = frontmatter.Post(article.get("body", ""))
     post["title"] = article.get("title")
     post["tags"] = article.get("tags", [])
@@ -38,12 +35,22 @@ def convert_file(json_path: Path, category_dir: Path):
     post["modified_date"] = article.get("modified_date")
     post["url"] = article.get("url")
     post["article_id"] = article.get("article_id")
+    return post
 
-    filename = safe_filename(article.get("title"), article.get("article_id"))
-    output_path = category_dir / filename
 
+def write_markdown_file(article: dict, output_path: Path) -> None:
+    post = build_markdown_post(article)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         frontmatter.dump(post, f)
+
+
+def convert_file(json_path: Path, category_dir: Path):
+    with open(json_path, "r", encoding="utf-8") as f:
+        article = json.load(f)
+
+    filename = safe_filename(article.get("title"), article.get("article_id"))
+    write_markdown_file(article, category_dir / filename)
 
 
 def main():

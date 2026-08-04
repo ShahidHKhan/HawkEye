@@ -93,7 +93,9 @@ create table if not exists article_state (
 -- Deliberately has no foreign keys to chunks or article_state -- a run's
 -- outcome should stay readable even if the articles/chunks it touched are
 -- later deleted or renumbered. changes is a free-form jsonb summary, e.g.
--- {"new": [...], "changed": [{"article_id", "title", "chunk_count"}, ...], "removed": [...]}.
+-- {"new": [{"article_id", "title", "chunk_count"}, ...], "changed": [...], "removed": [...],
+--  "healed": [{"article_id", "title"}, ...]} -- "healed" entries were classified as new by the
+-- diff but already had chunks (article_state lost track of them); see refresh_kb.py.
 create table if not exists refresh_runs (
     id bigserial primary key,
     scope text not null,

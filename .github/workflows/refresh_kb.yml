@@ -1,0 +1,31 @@
+name: Weekly KB refresh
+
+on:
+  schedule:
+    # Sunday 11:00 PM US Eastern == Monday 03:00 UTC, using the current EDT
+    # (UTC-4) offset. GitHub Actions cron is fixed UTC and does NOT auto-adjust
+    # for US DST -- during EST (UTC-5, roughly Nov-Mar) this will actually fire
+    # at 10:00 PM Eastern instead of 11:00 PM, a one-hour drift twice a year.
+    # For a weekly low-urgency refresh this is low-stakes; revisit this cron
+    # expression manually if the drift ever matters.
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v3
+
+      - run: uv sync --frozen --no-dev
+
+      - run: uv run python refresh_kb.py
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
