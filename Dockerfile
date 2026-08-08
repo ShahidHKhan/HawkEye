@@ -8,7 +8,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY app.py ./
+COPY app.py visualize_embeddings.py ./
 COPY implementation ./implementation
 COPY static ./static
 

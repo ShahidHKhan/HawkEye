@@ -6,11 +6,17 @@ from dotenv import load_dotenv
 from psycopg.types.json import Jsonb
 
 from implementation.answer import answer_question_stream, db_pool
+from visualize_embeddings import build_figure, fetch_chunks, reduce_to_3d
 
 ASSISTANT_AVATAR = "static/hawkeye-icon.svg"
 FAVICON = "static/hawkeye-icon.svg"
 
 load_dotenv(override=True)
+
+# Shared across every technician's session -- the embedding map is the same
+# knowledge base for everyone, so one person pays the ~1-2 minute PCA/t-SNE
+# cost and everyone else who opens the tab afterward gets it instantly.
+_kb_map_cache = {"coords": None, "doc_types": None, "hover_texts": None}
 
 
 def extract_text(content) -> str:
@@ -138,6 +144,42 @@ def load_refresh_runs():
     return gr.update(value=format_refresh_runs(rows)), ""
 
 
+def _load_kb_map(force: bool, progress: gr.Progress):
+    if force or _kb_map_cache["coords"] is None:
+        progress(0, desc="Fetching chunks from Supabase...")
+        doc_types, hover_texts, vectors = fetch_chunks()
+        progress(0.3, desc=f"Reducing {len(doc_types):,} embeddings to 3D...")
+        coords = reduce_to_3d(vectors)
+        _kb_map_cache.update(coords=coords, doc_types=doc_types, hover_texts=hover_texts)
+
+    categories = sorted(set(_kb_map_cache["doc_types"]))
+    fig = build_figure(
+        _kb_map_cache["coords"], _kb_map_cache["doc_types"], _kb_map_cache["hover_texts"],
+        "dark", 4, categories,
+    )
+    return gr.update(choices=categories, value=categories), fig
+
+
+def load_kb_map(progress=gr.Progress()):
+    """Cached load, used when the tab is first opened -- instant after the first technician warms it."""
+    return _load_kb_map(force=False, progress=progress)
+
+
+def force_load_kb_map(progress=gr.Progress()):
+    """Bypasses the cache -- use after a KB refresh has changed the chunks table."""
+    return _load_kb_map(force=True, progress=progress)
+
+
+def rebuild_kb_map(theme: str, marker_size: int, categories: list[str]):
+    """Cheap re-render (theme/marker/category filter) against the already-cached layout."""
+    if _kb_map_cache["coords"] is None:
+        return None
+    return build_figure(
+        _kb_map_cache["coords"], _kb_map_cache["doc_types"], _kb_map_cache["hover_texts"],
+        theme, marker_size, categories,
+    )
+
+
 def chat_stream(message: str, history: list[dict]):
     """
     Streaming version of the production pipeline: yields (partial_answer, context)
@@ -214,11 +256,48 @@ def main():
                 refresh_runs_empty = gr.Markdown(value="")
                 refresh_runs_button = gr.Button("Refresh", size="sm")
 
+            with gr.Tab("Knowledge Map") as kb_map_tab:
+                gr.Markdown(
+                    "3D map of every chunk in the knowledge base, colored by category. "
+                    "First open takes 1-2 minutes to compute; cached after that for everyone "
+                    "until someone clicks Recompute."
+                )
+                with gr.Row():
+                    kb_map_theme = gr.Radio(["dark", "light"], value="dark", label="Background")
+                    kb_map_marker_size = gr.Slider(1, 10, value=4, step=1, label="Marker size")
+                kb_map_categories = gr.CheckboxGroup(choices=[], value=[], label="Categories shown")
+                kb_map_plot = gr.Plot()
+                kb_map_recompute_button = gr.Button(
+                    "Recompute (after a KB refresh)", size="sm", variant="secondary"
+                )
+
             refresh_tab.select(
                 load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
             )
             refresh_runs_button.click(
                 load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
+            )
+
+            kb_map_tab.select(
+                load_kb_map, inputs=None, outputs=[kb_map_categories, kb_map_plot]
+            )
+            kb_map_recompute_button.click(
+                force_load_kb_map, inputs=None, outputs=[kb_map_categories, kb_map_plot]
+            )
+            kb_map_theme.change(
+                rebuild_kb_map,
+                inputs=[kb_map_theme, kb_map_marker_size, kb_map_categories],
+                outputs=kb_map_plot,
+            )
+            kb_map_marker_size.change(
+                rebuild_kb_map,
+                inputs=[kb_map_theme, kb_map_marker_size, kb_map_categories],
+                outputs=kb_map_plot,
+            )
+            kb_map_categories.change(
+                rebuild_kb_map,
+                inputs=[kb_map_theme, kb_map_marker_size, kb_map_categories],
+                outputs=kb_map_plot,
             )
 
         def put_message_in_chatbot(msg, hist):
