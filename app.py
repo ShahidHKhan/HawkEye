@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 
 import gradio as gr
@@ -144,39 +145,63 @@ def load_refresh_runs():
     return gr.update(value=format_refresh_runs(rows)), ""
 
 
-def _load_kb_map(force: bool, progress: gr.Progress):
-    if force or _kb_map_cache["coords"] is None:
-        progress(0, desc="Fetching chunks from Supabase...")
-        doc_types, hover_texts, vectors = fetch_chunks()
-        progress(0.3, desc=f"Reducing {len(doc_types):,} embeddings to 3D...")
-        coords = reduce_to_3d(vectors)
-        _kb_map_cache.update(coords=coords, doc_types=doc_types, hover_texts=hover_texts)
+KB_MAP_THEME = "light"
+KB_MAP_MARKER_SIZE = 3
+HEARTBEAT_SECONDS = 4  # how often to nudge the progress bar during a blocking step
 
-    categories = sorted(set(_kb_map_cache["doc_types"]))
-    fig = build_figure(
-        _kb_map_cache["coords"], _kb_map_cache["doc_types"], _kb_map_cache["hover_texts"],
-        "dark", 4, categories,
-    )
-    return gr.update(choices=categories, value=categories), fig
+
+def _run_with_heartbeat(fn, progress: gr.Progress, desc: str, start: float, end: float):
+    """
+    Runs `fn` (a slow, blocking, no-arg callable) on a background thread while
+    this thread periodically calls `progress(...)`. Gradio's progress bar sends
+    real traffic over the same channel the browser's websocket is watching --
+    without a heartbeat, a multi-minute silent gap here (PCA/t-SNE on ~8k
+    chunks) reads as a dead connection to any proxy in front of the app (Fly's
+    included) and it drops the socket, which is what was kicking technicians
+    back to the login screen.
+    """
+    result: dict = {}
+    error: dict = {}
+
+    def target():
+        try:
+            result["value"] = fn()
+        except Exception as e:
+            error["value"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    elapsed = 0
+    while thread.is_alive():
+        thread.join(timeout=HEARTBEAT_SECONDS)
+        elapsed += HEARTBEAT_SECONDS
+        frac = start + min(elapsed / 90, 1.0) * (end - start)
+        progress(frac, desc=f"{desc}... ({elapsed}s)")
+
+    if "value" in error:
+        raise error["value"]
+    return result["value"]
 
 
 def load_kb_map(progress=gr.Progress()):
-    """Cached load, used when the tab is first opened -- instant after the first technician warms it."""
-    return _load_kb_map(force=False, progress=progress)
-
-
-def force_load_kb_map(progress=gr.Progress()):
-    """Bypasses the cache -- use after a KB refresh has changed the chunks table."""
-    return _load_kb_map(force=True, progress=progress)
-
-
-def rebuild_kb_map(theme: str, marker_size: int, categories: list[str]):
-    """Cheap re-render (theme/marker/category filter) against the already-cached layout."""
+    """
+    Cached load, used when the tab is first opened -- instant after the first
+    technician warms it. No controls on this tab by design: fixed theme/size,
+    just click and look.
+    """
     if _kb_map_cache["coords"] is None:
-        return None
+        doc_types, hover_texts, vectors = _run_with_heartbeat(
+            fetch_chunks, progress, "Fetching chunks from Supabase", 0.0, 0.2
+        )
+        coords = _run_with_heartbeat(
+            lambda: reduce_to_3d(vectors), progress, "Reducing embeddings to 3D", 0.2, 0.95
+        )
+        _kb_map_cache.update(coords=coords, doc_types=doc_types, hover_texts=hover_texts)
+
+    categories = sorted(set(_kb_map_cache["doc_types"]))
     return build_figure(
         _kb_map_cache["coords"], _kb_map_cache["doc_types"], _kb_map_cache["hover_texts"],
-        theme, marker_size, categories,
+        KB_MAP_THEME, KB_MAP_MARKER_SIZE, categories,
     )
 
 
@@ -258,18 +283,9 @@ def main():
 
             with gr.Tab("Knowledge Map") as kb_map_tab:
                 gr.Markdown(
-                    "3D map of every chunk in the knowledge base, colored by category. "
-                    "First open takes 1-2 minutes to compute; cached after that for everyone "
-                    "until someone clicks Recompute."
+                    "3D map of every chunk in the knowledge base, colored by category."
                 )
-                with gr.Row():
-                    kb_map_theme = gr.Radio(["dark", "light"], value="dark", label="Background")
-                    kb_map_marker_size = gr.Slider(1, 10, value=4, step=1, label="Marker size")
-                kb_map_categories = gr.CheckboxGroup(choices=[], value=[], label="Categories shown")
                 kb_map_plot = gr.Plot()
-                kb_map_recompute_button = gr.Button(
-                    "Recompute (after a KB refresh)", size="sm", variant="secondary"
-                )
 
             refresh_tab.select(
                 load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
@@ -278,27 +294,7 @@ def main():
                 load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
             )
 
-            kb_map_tab.select(
-                load_kb_map, inputs=None, outputs=[kb_map_categories, kb_map_plot]
-            )
-            kb_map_recompute_button.click(
-                force_load_kb_map, inputs=None, outputs=[kb_map_categories, kb_map_plot]
-            )
-            kb_map_theme.change(
-                rebuild_kb_map,
-                inputs=[kb_map_theme, kb_map_marker_size, kb_map_categories],
-                outputs=kb_map_plot,
-            )
-            kb_map_marker_size.change(
-                rebuild_kb_map,
-                inputs=[kb_map_theme, kb_map_marker_size, kb_map_categories],
-                outputs=kb_map_plot,
-            )
-            kb_map_categories.change(
-                rebuild_kb_map,
-                inputs=[kb_map_theme, kb_map_marker_size, kb_map_categories],
-                outputs=kb_map_plot,
-            )
+            kb_map_tab.select(load_kb_map, inputs=None, outputs=kb_map_plot)
 
         def put_message_in_chatbot(msg, hist):
             return "", hist + [{"role": "user", "content": msg}]
