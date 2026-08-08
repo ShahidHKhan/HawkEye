@@ -16,7 +16,6 @@ import plotly.graph_objects as go
 import psycopg
 from dotenv import load_dotenv
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 
 load_dotenv(override=True)
 
@@ -85,14 +84,13 @@ def fetch_chunks() -> tuple[list[str], list[str], np.ndarray]:
 
 def reduce_to_3d(vectors: np.ndarray) -> np.ndarray:
     """
-    PCA to <=50 dims first (sklearn's own recommendation for high-dimensional
-    input), then t-SNE down to 3 -- t-SNE run directly on 3,072-dim Gemini
-    embeddings is dramatically slower and the PCA pre-reduction barely changes
-    the resulting layout.
+    Straight PCA down to 3 dimensions -- a single SVD, near-instant regardless
+    of environment. Tried t-SNE first for its tighter-looking clusters, but it
+    ran roughly 10x slower on the production Fly box (shared vCPU) than in
+    local testing, turning the Knowledge Map tab's first load into a
+    multi-minute wait with no reliable way to predict or bound it.
     """
-    pca_dims = min(50, vectors.shape[0] - 1, vectors.shape[1])
-    pre_reduced = PCA(n_components=pca_dims, random_state=42).fit_transform(vectors)
-    return TSNE(n_components=3, random_state=42, init="pca").fit_transform(pre_reduced)
+    return PCA(n_components=3, random_state=42).fit_transform(vectors)
 
 
 def build_figure(
@@ -138,7 +136,7 @@ def build_figure(
 def load_and_reduce(progress=gr.Progress()):
     progress(0, desc="Fetching chunks from Supabase...")
     doc_types, hover_texts, vectors = fetch_chunks()
-    progress(0.3, desc=f"Reducing {len(doc_types):,} embeddings to 3D (PCA + t-SNE)...")
+    progress(0.3, desc=f"Projecting {len(doc_types):,} embeddings to 3D (PCA)...")
     coords = reduce_to_3d(vectors)
     progress(0.9, desc="Rendering...")
 

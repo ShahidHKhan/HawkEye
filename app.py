@@ -1,5 +1,4 @@
 import os
-import threading
 import time
 
 import gradio as gr
@@ -147,55 +146,21 @@ def load_refresh_runs():
 
 KB_MAP_THEME = "light"
 KB_MAP_MARKER_SIZE = 3
-HEARTBEAT_SECONDS = 4  # how often to nudge the progress bar during a blocking step
-
-
-def _run_with_heartbeat(fn, progress: gr.Progress, desc: str, start: float, end: float):
-    """
-    Runs `fn` (a slow, blocking, no-arg callable) on a background thread while
-    this thread periodically calls `progress(...)`. Gradio's progress bar sends
-    real traffic over the same channel the browser's websocket is watching --
-    without a heartbeat, a multi-minute silent gap here (PCA/t-SNE on ~8k
-    chunks) reads as a dead connection to any proxy in front of the app (Fly's
-    included) and it drops the socket, which is what was kicking technicians
-    back to the login screen.
-    """
-    result: dict = {}
-    error: dict = {}
-
-    def target():
-        try:
-            result["value"] = fn()
-        except Exception as e:
-            error["value"] = e
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    elapsed = 0
-    while thread.is_alive():
-        thread.join(timeout=HEARTBEAT_SECONDS)
-        elapsed += HEARTBEAT_SECONDS
-        frac = start + min(elapsed / 90, 1.0) * (end - start)
-        progress(frac, desc=f"{desc}... ({elapsed}s)")
-
-    if "value" in error:
-        raise error["value"]
-    return result["value"]
 
 
 def load_kb_map(progress=gr.Progress()):
     """
     Cached load, used when the tab is first opened -- instant after the first
     technician warms it. No controls on this tab by design: fixed theme/size,
-    just click and look.
+    just click and look. Both steps are fast (a streamed DB fetch, then a
+    single PCA projection), so no heartbeat/threading is needed here -- see
+    reduce_to_3d's docstring for why t-SNE was dropped in favor of plain PCA.
     """
     if _kb_map_cache["coords"] is None:
-        doc_types, hover_texts, vectors = _run_with_heartbeat(
-            fetch_chunks, progress, "Fetching chunks from Supabase", 0.0, 0.2
-        )
-        coords = _run_with_heartbeat(
-            lambda: reduce_to_3d(vectors), progress, "Reducing embeddings to 3D", 0.2, 0.95
-        )
+        progress(0, desc="Fetching chunks from Supabase...")
+        doc_types, hover_texts, vectors = fetch_chunks()
+        progress(0.7, desc="Projecting embeddings to 3D...")
+        coords = reduce_to_3d(vectors)
         _kb_map_cache.update(coords=coords, doc_types=doc_types, hover_texts=hover_texts)
 
     categories = sorted(set(_kb_map_cache["doc_types"]))

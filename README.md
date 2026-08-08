@@ -44,12 +44,12 @@ question through a multi-step RAG pipeline:
 **4. Chat UI.** `app.py` is a Gradio app (basic-auth gated) with three tabs:
 an **Assistant** tab (chat + a live "Retrieved sources" panel showing the
 chunks used for the current answer), a **Refresh History** tab (read-only
-view of the weekly KB refresh runs, below), and a **Knowledge Map** tab (a rotatable 3D point cloud of every chunk's
-embedding, colored by category — see `visualize_embeddings.py`; no controls,
-just click the tab. Computed once and cached server-side so only the first
-person to open it pays the ~1-2 minute PCA/t-SNE cost). Every query and
-every thumbs-up/down is logged to Supabase (`queries`, `feedback` tables)
-for later analysis.
+view of the weekly KB refresh runs, below), and a **Knowledge Map** tab (a
+rotatable 3D point cloud of every chunk's embedding, colored by category —
+see `visualize_embeddings.py`; no controls, just click the tab. A single PCA
+projection, computed once and cached server-side so it's near-instant for
+everyone after the first click). Every query and every thumbs-up/down is
+logged to Supabase (`queries`, `feedback` tables) for later analysis.
 
 **5. Weekly KB refresh.** `refresh_kb.py`, run by
 `.github/workflows/refresh_kb.yml` every Sunday night, re-crawls the public
@@ -120,8 +120,8 @@ listed in `.env.example`.
   tooling and dashboard
 - `migrate_to_supabase.py` — one-off migration of chunks from the old local
   Chroma store into Supabase; not part of the normal workflow
-- `visualize_embeddings.py` — chunking-space 3D visualization (PCA + t-SNE
-  + Plotly). Powers the app's Knowledge Map tab, and doubles as a standalone
+- `visualize_embeddings.py` — chunk-space 3D visualization (PCA + Plotly).
+  Powers the app's Knowledge Map tab, and doubles as a standalone
   Gradio app (`uv run visualize_embeddings.py`) for grabbing screenshots
 - `day1.ipynb`–`day3.ipynb`, `rag_build_guide.md` — R&D notebooks tracing the
   build from a naive RAG pipeline to the current one; local Chroma
