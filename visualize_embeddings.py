@@ -41,20 +41,46 @@ SURFACE = {"light": "#fcfcfb", "dark": "#1a1a19"}
 INK = {"light": "#0b0b0b", "dark": "#ffffff"}
 
 
-def fetch_chunks() -> tuple[list[str], list[str], np.ndarray]:
-    """Pull every chunk's category, a hover snippet, and its embedding out of Supabase."""
-    with psycopg.connect(SUPABASE_DB_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT type, page_content, embedding::text FROM chunks ORDER BY id")
-            rows = cur.fetchall()
+FETCH_BATCH_SIZE = 200
 
-    doc_types = [row[0] or "unknown" for row in rows]
-    hover_texts = [row[1][:HOVER_TEXT_LEN].replace("\n", " ") for row in rows]
-    vectors = np.array(
-        [[float(x) for x in row[2].strip("[]").split(",")] for row in rows],
-        dtype=np.float32,
-    )
-    return doc_types, hover_texts, vectors
+
+def fetch_chunks() -> tuple[list[str], list[str], np.ndarray]:
+    """
+    Pull every chunk's category, a hover snippet, and its embedding out of Supabase.
+
+    Streamed via a server-side cursor and converted to float32 one row at a time
+    -- each embedding round-trips as ~39KB of text (a 3,072-dim vector as ASCII
+    numbers), and pulling all of them with fetchall() plus a naive per-element
+    float() list comprehension briefly holds tens of millions of individual
+    Python float/str objects in memory at once. On the 1GB Fly machine this app
+    runs on, that was enough to OOM-kill the whole container mid-request --
+    which looks to the browser like the server connection dying outright.
+    page_content is truncated in SQL for the same reason: only a hover snippet
+    is ever needed here, so there's no reason to pull the full chunk text over
+    the wire.
+    """
+    doc_types: list[str] = []
+    hover_texts: list[str] = []
+    vectors: list[np.ndarray] = []
+
+    with psycopg.connect(SUPABASE_DB_URL) as conn:
+        with conn.cursor(name="kb_map_chunks") as cur:
+            cur.execute(
+                "SELECT type, left(page_content, %s), embedding::text FROM chunks ORDER BY id",
+                (HOVER_TEXT_LEN,),
+            )
+            while True:
+                batch = cur.fetchmany(FETCH_BATCH_SIZE)
+                if not batch:
+                    break
+                for doc_type, snippet, embedding_text in batch:
+                    doc_types.append(doc_type or "unknown")
+                    hover_texts.append((snippet or "").replace("\n", " "))
+                    vectors.append(
+                        np.array(embedding_text.strip("[]").split(","), dtype=np.float32)
+                    )
+
+    return doc_types, hover_texts, np.stack(vectors)
 
 
 def reduce_to_3d(vectors: np.ndarray) -> np.ndarray:
