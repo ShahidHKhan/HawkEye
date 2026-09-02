@@ -96,6 +96,17 @@ REFRESH_RUNS_HEADERS = [
 ]
 REFRESH_RUNS_DATATYPES = ["str", "str", "str", "number", "number", "number", "number", "str", "str"]
 
+REFRESH_RUNS_DETAIL_PLACEHOLDER = "*Select a run above to see which articles it touched.*"
+
+# refresh_kb.py's changes jsonb buckets, in the order they're worth reading.
+REFRESH_RUNS_BUCKETS = [
+    ("new", "Added"),
+    ("changed", "Updated"),
+    ("removed", "Removed"),
+    ("healed", "Healed — had chunks but article_state had lost track of them"),
+    ("failed", "Failed — skipped, the rest of the run continued"),
+]
+
 
 def fetch_refresh_runs(limit: int = 20) -> list[tuple]:
     with db_pool.connection() as conn:
@@ -103,7 +114,7 @@ def fetch_refresh_runs(limit: int = 20) -> list[tuple]:
             cur.execute(
                 """
                 SELECT started_at, finished_at, scope, new_count, changed_count,
-                       unchanged_count, removed_count, error
+                       unchanged_count, removed_count, error, changes
                 FROM refresh_runs
                 ORDER BY started_at DESC
                 LIMIT %s
@@ -113,9 +124,42 @@ def fetch_refresh_runs(limit: int = 20) -> list[tuple]:
             return cur.fetchall()
 
 
+def format_run_details(changes: dict | None, error: str | None = None) -> str:
+    """
+    Render one run's changes jsonb as markdown: which articles it actually
+    touched, not just how many. Worth having as its own panel because the table's
+    counts come from the diff, so they say what a run set out to do -- this says
+    what it did. `error` is only used to tell an empty successful run ("nothing
+    had changed upstream") apart from an empty failed one ("it never got that
+    far"), which otherwise look identical here.
+    """
+    sections = []
+    for key, label in REFRESH_RUNS_BUCKETS:
+        items = (changes or {}).get(key) or []
+        if not items:
+            continue
+        lines = [f"**{label}** ({len(items)})", ""]
+        for item in items:
+            line = f"- `{item.get('article_id')}` {item.get('title') or '*untitled*'}"
+            if item.get("chunk_count") is not None:
+                line += f" — {item['chunk_count']} chunks"
+            if item.get("error"):
+                line += f" — {item['error']}"
+            lines.append(line)
+        sections.append("\n".join(lines))
+
+    if sections:
+        return "\n\n".join(sections)
+    if error:
+        return "*No articles were processed — this run stopped on an error before reaching any. See the Error column.*"
+    if changes is None:
+        return "*This run recorded no per-article detail.*"
+    return "*This run touched no articles — everything was already up to date.*"
+
+
 def format_refresh_runs(rows: list[tuple]) -> list[list]:
     formatted = []
-    for started_at, finished_at, scope, new, changed, unchanged, removed, error in rows:
+    for started_at, finished_at, scope, new, changed, unchanged, removed, error, _changes in rows:
         if error:
             status = "Failed"
         elif finished_at is None:
@@ -140,8 +184,23 @@ def load_refresh_runs():
     """Read-only fetch of the most recent KB refresh runs; no writes to refresh_runs."""
     rows = fetch_refresh_runs(20)
     if not rows:
-        return gr.update(value=[]), "*No refresh runs recorded yet.*"
-    return gr.update(value=format_refresh_runs(rows)), ""
+        return gr.update(value=[]), "*No refresh runs recorded yet.*", [], REFRESH_RUNS_DETAIL_PLACEHOLDER
+    # Each run's error + changes jsonb is parked in a State alongside the table so
+    # a row click can render its detail by index without going back to the database.
+    return (
+        gr.update(value=format_refresh_runs(rows)),
+        "",
+        [{"error": row[7], "changes": row[8]} for row in rows],
+        REFRESH_RUNS_DETAIL_PLACEHOLDER,
+    )
+
+
+def show_run_details(run_details: list, evt: gr.SelectData) -> str:
+    """Row-click handler for the runs table: show the selected run's article list."""
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if not run_details or row is None or row >= len(run_details):
+        return REFRESH_RUNS_DETAIL_PLACEHOLDER
+    return format_run_details(run_details[row]["changes"], run_details[row]["error"])
 
 
 KB_MAP_THEME = "light"
@@ -245,6 +304,8 @@ def main():
                 )
                 refresh_runs_empty = gr.Markdown(value="")
                 refresh_runs_button = gr.Button("Refresh", size="sm")
+                refresh_runs_state = gr.State([])
+                refresh_runs_details = gr.Markdown(value=REFRESH_RUNS_DETAIL_PLACEHOLDER)
 
             with gr.Tab("Knowledge Map") as kb_map_tab:
                 gr.Markdown(
@@ -252,11 +313,13 @@ def main():
                 )
                 kb_map_plot = gr.Plot()
 
-            refresh_tab.select(
-                load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
-            )
-            refresh_runs_button.click(
-                load_refresh_runs, inputs=None, outputs=[refresh_runs_table, refresh_runs_empty]
+            refresh_runs_outputs = [
+                refresh_runs_table, refresh_runs_empty, refresh_runs_state, refresh_runs_details,
+            ]
+            refresh_tab.select(load_refresh_runs, inputs=None, outputs=refresh_runs_outputs)
+            refresh_runs_button.click(load_refresh_runs, inputs=None, outputs=refresh_runs_outputs)
+            refresh_runs_table.select(
+                show_run_details, inputs=refresh_runs_state, outputs=refresh_runs_details
             )
 
             kb_map_tab.select(load_kb_map, inputs=None, outputs=kb_map_plot)

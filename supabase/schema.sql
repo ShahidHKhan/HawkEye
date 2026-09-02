@@ -94,8 +94,11 @@ create table if not exists article_state (
 -- outcome should stay readable even if the articles/chunks it touched are
 -- later deleted or renumbered. changes is a free-form jsonb summary, e.g.
 -- {"new": [{"article_id", "title", "chunk_count"}, ...], "changed": [...], "removed": [...],
---  "healed": [{"article_id", "title"}, ...]} -- "healed" entries were classified as new by the
--- diff but already had chunks (article_state lost track of them); see refresh_kb.py.
+--  "healed": [{"article_id", "title"}, ...],
+--  "failed": [{"article_id", "title", "error"}, ...]} -- "healed" entries were classified as
+-- new by the diff but already had chunks (article_state lost track of them); "failed" entries
+-- hit an error and were skipped without aborting the rest of the run, and are also summarized
+-- into the error column so the run still reads as failed. See refresh_kb.py.
 create table if not exists refresh_runs (
     id bigserial primary key,
     scope text not null,
