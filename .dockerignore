@@ -6,10 +6,15 @@ __pycache__/
 .env
 .python-version
 
-*.ipynb
+# R&D, evaluation, and maintenance paths -- the image only needs to serve app.py.
+# refresh_kb.py and scraper/ deliberately stay out too: the weekly refresh runs in
+# GitHub Actions (.github/workflows/refresh_kb.yml), not in this container.
+notebooks/
+docs/
+scripts/
 evaluation/
-evaluator.py
-rag_build_guide.md
+tests/
+refresh_kb.py
 scraper/
 knowledge-base/
 vector_db/

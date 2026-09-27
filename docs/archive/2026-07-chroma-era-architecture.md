@@ -1,3 +1,22 @@
+> **ARCHIVED — describes a superseded architecture. Do not read this as current.**
+>
+> This is a snapshot of the pipeline as it existed at commit `200754d`
+> ("DAY 6", 2026-07-14), when retrieval ran against **local Chroma stores**
+> (`preprocessed_db/`, `vector_db/`). That is no longer how HawkEye works.
+>
+> Commit `92f01d5` migrated ingestion and retrieval to **Supabase Postgres +
+> pgvector**, and everything below about `chromadb.PersistentClient`,
+> `collection.query()`, `collection.add()`, positional string chunk ids, and
+> resume-by-positional-id is obsolete as a result. The current pipeline is
+> described in the top-level [README](../../README.md); the schema it retrieves
+> from is [`supabase/schema.sql`](../../supabase/schema.sql).
+>
+> Kept only as a record of the earlier design and of the reasoning behind the
+> multi-step retrieval pipeline (decompose -> rewrite -> dual-retrieve -> rerank),
+> which did survive the migration essentially unchanged.
+
+---
+
 # HawkEye Repo Investigation — Findings for Architecture Documentation
 
 Investigated by reading every file directly (not reconstructed from memory of similar projects). All function names, model names, file paths, and line numbers below reflect the exact state of the repo as of commit `200754d` ("DAY 6", 2026-07-14) on branch `master`.

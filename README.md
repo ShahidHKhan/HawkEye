@@ -63,8 +63,8 @@ crawl failure rather than genuine content removal. Every run, success or
 failure, is logged to `refresh_runs` and visible in the app's Refresh
 History tab.
 
-**6. Evaluation.** `evaluator.py` (a separate Gradio dashboard) and
-`evaluation/eval.py` measure retrieval quality (MRR, nDCG, keyword coverage)
+**6. Evaluation.** `evaluation/evaluator.py` (a separate Gradio dashboard,
+`uv run python -m evaluation.evaluator`) and `evaluation/eval.py` measure retrieval quality (MRR, nDCG, keyword coverage)
 and answer quality (LLM-judged accuracy/completeness/relevance) against the
 hand-built test set in `evaluation/tests.jsonl`.
 
@@ -116,14 +116,19 @@ listed in `.env.example`.
   folder per top-level category
 - `supabase/schema.sql` — production schema (Postgres + pgvector), kept as
   a reconciled snapshot of the live Supabase schema
-- `evaluation/`, `evaluator.py` — retrieval/answer quality evaluation
-  tooling and dashboard
-- `migrate_to_supabase.py` — one-off migration of chunks from the old local
-  Chroma store into Supabase; not part of the normal workflow
+- `evaluation/` — retrieval/answer quality evaluation tooling (`eval.py`,
+  `tests.jsonl`) and the metrics dashboard (`evaluator.py`). Both are run as
+  modules from the repo root, e.g. `uv run python -m evaluation.evaluator`
 - `visualize_embeddings.py` — chunk-space 3D visualization (PCA + Plotly).
   Powers the app's Knowledge Map tab, and doubles as a standalone
   Gradio app (`uv run visualize_embeddings.py`) for grabbing screenshots
-- `day1.ipynb`–`day3.ipynb`, `rag_build_guide.md` — R&D notebooks tracing the
-  build from a naive RAG pipeline to the current one; local Chroma
-  (`vector_db/`, `preprocessed_db/`) is used only in this R&D path, not in
-  production
+- `tests/` — offline tests plus a read-only live-database audit; see
+  `tests/README.md`
+- `notebooks/` — R&D notebooks (`day1`–`day3`) tracing the build from a naive
+  RAG pipeline to the current one, plus the `rag_build_guide.md` scaffold they
+  were worked through against. Local Chroma (`vector_db/`, `preprocessed_db/`)
+  is used only in this R&D path, never in production
+- `scripts/archive/` — completed one-off scripts, kept as a record: the
+  original Chroma → Supabase chunk migration
+- `docs/archive/` — a detailed snapshot of the superseded Chroma-era
+  architecture, retained for its design reasoning

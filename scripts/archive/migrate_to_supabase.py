@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-DB_NAME = str(Path(__file__).parent / "preprocessed_db")
+# Repo root is three levels up now that this lives in scripts/archive/.
+DB_NAME = str(Path(__file__).parent.parent.parent / "preprocessed_db")
 COLLECTION_NAME = "docs"
 BATCH_SIZE = 500
 
