@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v3
+
+      # --no-dev on purpose: it installs the same set app.py and refresh_kb.py get
+      # in production, so this job also catches an import that only ever resolved
+      # through a dev or transitive dependency.
+      - run: uv sync --frozen --no-dev
+
+      # Deliberately given no secrets. Both suites setdefault() placeholder
+      # SUPABASE_DB_URL / GOOGLE_API_KEY values before importing (the
+      # implementation modules build a connection pool and a Gemini client at
+      # import time), and nothing in them touches the network -- so if one ever
+      # starts reaching out, it fails here rather than quietly hitting the real
+      # database. See tests/README.md.
+      - name: Offline tests
+        run: |
+          python tests/test_refresh_kb.py
+          python tests/test_app.py
+
+      # Guards the entry points the two suites don't import: a broken
+      # visualize_embeddings or scraper module would otherwise only surface on
+      # deploy, or in the weekly refresh run.
+      - name: Import check
+        run: |
+          python -c "
+          import importlib, os, sys
+          os.environ['SUPABASE_DB_URL'] = 'postgresql://placeholder/unused'
+          os.environ['GOOGLE_API_KEY'] = 'placeholder-unused'
+          sys.path.insert(0, os.getcwd())
+          for m in ['app', 'refresh_kb', 'visualize_embeddings',
+                    'implementation.answer', 'implementation.ingest',
+                    'implementation.diff_articles',
+                    'scraper.scrape_kb', 'scraper.convert_to_markdown']:
+              importlib.import_module(m)
+              print('ok', m)
+          "

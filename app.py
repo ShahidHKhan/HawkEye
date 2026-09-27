@@ -254,7 +254,35 @@ def chat_stream(message: str, history: list[dict]):
         yield friendly, "*Error retrieving context — this attempt has been logged.*"
 
 
+def require_auth_credentials() -> tuple[str, str]:
+    """
+    APP_USERNAME / APP_PASSWORD, or a hard failure.
+
+    Checked here rather than at import time because tests/test_app.py imports this
+    module, and reading the Refresh History helpers shouldn't require the server's
+    credentials -- but launching the server must. Without this, a missing variable
+    made os.getenv return None and Gradio received auth=[(None, None)], standing
+    the app up with a login form in an unclear state instead of refusing to start.
+    For an internal tool reachable on the public internet, failing loudly at boot
+    is the only safe reading of "the password variable isn't set."
+    """
+    username = os.getenv("APP_USERNAME")
+    password = os.getenv("APP_PASSWORD")
+    missing = [
+        name for name, value in (("APP_USERNAME", username), ("APP_PASSWORD", password))
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{' and '.join(missing)} not set — refusing to start without basic auth. "
+            f"Add them to your .env file (see .env.example), or to the host's secrets "
+            f"when deploying."
+        )
+    return username, password
+
+
 def main():
+    username, password = require_auth_credentials()
     theme = gr.themes.Soft(
         primary_hue="blue", secondary_hue="slate", font=["Inter", "system-ui", "sans-serif"]
     )
@@ -362,7 +390,7 @@ def main():
 
     ui.launch(
         theme=theme,
-        auth=[(os.getenv("APP_USERNAME"), os.getenv("APP_PASSWORD"))],
+        auth=[(username, password)],
         server_name="0.0.0.0",
         server_port=int(os.getenv("PORT", 7860)),
         favicon_path=FAVICON,
