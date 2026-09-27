@@ -68,6 +68,13 @@ History tab.
 and answer quality (LLM-judged accuracy/completeness/relevance) against the
 hand-built test set in `evaluation/tests.jsonl`.
 
+## License
+
+Proprietary — see [LICENSE](LICENSE). The code is mine; the knowledge-base
+articles it indexes belong to SUNY New Paltz and are neither licensed nor
+distributed here (`knowledge-base/` is gitignored, and the gated
+`Internal-Documentation` category is excluded from the automated refresh).
+
 ## Local development
 
 ```bash
