@@ -1,7 +1,0 @@
-gradio
-python-dotenv
-langchain-google-genai
-langchain-core
-psycopg2-binary
-tenacity
-pydantic

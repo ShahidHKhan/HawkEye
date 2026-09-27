@@ -1,30 +1,32 @@
 # Secrets - never commit
 .env
 scraper/cookies.txt
- 
+
 # Knowledge base content - includes gated internal docs, regeneratable via scraper scripts
 knowledge-base/
- 
+
 # Python
 __pycache__/
 *.pyc
 .venv/
- 
+
 # Scraper intermediate output (regeneratable via scraper/scrape_kb.py)
 scraper/output/
 scraper/output-internal/
 scraper/*.html
 scraper/scrape_log.txt
- 
+
 # Vector stores (regeneratable via ingest scripts)
 vector_db/
 preprocessed_db/
- 
+
+# Chunk cache (regeneratable via ingest.py, kept in Drive backup)
+chunks_cache.jsonl
+
+# Query logs (local R&D logging, superseded by the queries table in Supabase)
+logs/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
- 
- # Chunk cache (regeneratable via ingest.py, kept in Drive backup)
-chunks_cache.jsonl
-
-logs/
+.vscode/
