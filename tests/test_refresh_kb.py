@@ -119,6 +119,24 @@ def test_prefer_category_falls_back_to_first_candidate():
     assert rk._prefer_category(candidates, None, lambda row: row[1]) == ("src-a", "Hardware")
 
 
+# --- chunking prompt -------------------------------------------------------
+
+def test_chunking_prompt_never_carries_a_machine_path():
+    """Article 42989's stored D:/ source made Gemini hang and 500 on every attempt."""
+    from implementation.ingest import make_prompt, prompt_source
+
+    relative = "Software-and-Apps/OneDrive-Synchronize-your-OneDrive-to-your-computer-Windows-42989.md"
+    for stored in (
+        "D:/mrsha/Projects/HawkEye/knowledge-base/" + relative,
+        "/home/runner/work/HawkEye/HawkEye/knowledge-base/" + relative,
+        "C:\\Users\\someone\\HawkEye\\knowledge-base\\" + relative.replace("/", "\\"),
+    ):
+        assert prompt_source(stored) == relative, stored
+        prompt = make_prompt({"type": "Software-and-Apps", "source": stored, "text": "body"})
+        assert "knowledge-base" not in prompt and relative in prompt, stored
+    assert prompt_source("somewhere/else/file-1.md") == "file-1.md"
+
+
 # --- circuit breaker -------------------------------------------------------
 
 def test_removal_safety_threshold():

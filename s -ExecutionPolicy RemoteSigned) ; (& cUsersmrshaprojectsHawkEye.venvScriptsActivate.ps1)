@@ -1,0 +1,145 @@
+[33mcommit 397ad2e255ec474dba05decba598186673083844[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: Shahid Khan <107818138+ShahidHKhan@users.noreply.github.com>
+Date:   Sun Sep 27 16:51:49 2026 -0400
+
+    Add a LICENSE
+    
+    Proprietary, all rights reserved. A permissive license would have been the wrong
+    default here: this is an internal help desk tool, specific to one institution's
+    TeamDynamix instance, and there's nothing in it a third party should be invited
+    to reuse. Absent any LICENSE the same restriction applied implicitly, but a
+    reviewer couldn't tell that from an oversight.
+    
+    The notice is explicit that it covers the source code only. This repository
+    indexes content it doesn't own, so it states that the knowledge-base articles
+    belong to SUNY New Paltz, aren't licensed here, and aren't distributed --
+    knowledge-base/ is gitignored and Internal-Documentation is access-gated and
+    excluded from the refresh. Summarized in a short README section too.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit e716f6dd3ac20eb962b9cd3af3268a3a1c219723[m
+Author: Shahid Khan <107818138+ShahidHKhan@users.noreply.github.com>
+Date:   Sun Sep 27 16:43:00 2026 -0400
+
+    Run the tests in CI, and refuse to start without basic auth
+    
+    The 26 offline tests guard real production failures -- the missing-markdown-mirror
+    bug that broke four consecutive weekly refresh runs, per-article failure
+    isolation, the circuit breaker's exit code -- and nothing was executing them.
+    .github/workflows/tests.yml now does, on every push and pull request.
+    
+    It installs with --no-dev, the same set app.py and refresh_kb.py get in
+    production, so it doubles as a guard on the dependency manifest: the tqdm gap
+    fixed in f9a6c45 is exactly the class of bug this would have caught. A second
+    step imports the entry points the suites don't cover (visualize_embeddings, both
+    scraper modules), which otherwise only fail on deploy or during the weekly run.
+    
+    The job is given no secrets deliberately. Both suites setdefault() placeholder
+    credentials before importing and never touch the network, so if one ever starts
+    reaching out it fails in CI instead of quietly hitting the live database.
+    
+    app.py's launch() passed auth=[(os.getenv("APP_USERNAME"), os.getenv("APP_PASSWORD"))]
+    with no validation, so a missing variable became auth=[(None, None)] and the app
+    stood up anyway with a login form in an unclear state. For an internal tool on a
+    public URL, that's the one failure mode worth being loud about, so
+    require_auth_credentials() now refuses to start and names the variable that's
+    missing -- matching how implementation/answer.py already treats SUPABASE_DB_URL.
+    Empty strings count as missing, not just unset ones.
+    
+    It's called from main() rather than at import time on purpose: tests/test_app.py
+    imports this module to exercise the Refresh History helpers, and that shouldn't
+    require the server's credentials. Launching it does.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit 443554f0746638193194728e5b085e5d71f286eb[m
+Author: Shahid Khan <107818138+ShahidHKhan@users.noreply.github.com>
+Date:   Sun Sep 27 16:41:00 2026 -0400
+
+    Archive the superseded architecture doc, group R&D out of the repo root
+    
+    ARCHITECTURE_FINDINGS.md was the most misleading file in the repo: 27KB of
+    precise, confident detail about a pipeline that hasn't existed since 92f01d5
+    migrated retrieval to Supabase + pgvector. It documented chromadb.PersistentClient,
+    collection.query(), positional string chunk ids and resume-by-positional-id as
+    current behavior, and directly contradicted the README. Moved to
+    docs/archive/2026-07-chroma-era-architecture.md with a header stating what
+    superseded it and pointing at the README and schema.sql, since its reasoning
+    about the multi-step retrieval design is still worth reading -- that part did
+    survive the migration.
+    
+    Repo root now holds only what runs in production (app.py, refresh_kb.py,
+    visualize_embeddings.py) plus configs, instead of mixing those with tutorial
+    notebooks and finished one-off scripts:
+    
+    - day1-3.ipynb + rag_build_guide.md -> notebooks/
+    - migrate_to_supabase.py -> scripts/archive/ (its preprocessed_db/ path needed
+      parent.parent.parent to keep resolving to the repo root)
+    - evaluator.py -> evaluation/evaluator.py, beside the eval code it's a dashboard
+      for. It needs no sys.path shim: evaluation/eval.py already documents itself as
+      `python -m evaluation.eval`, so -m from the repo root was the convention here
+      already, and `python -m evaluation.evaluator` matches it.
+    
+    Both new directories get a README explaining what they are and that they aren't
+    production. The notebooks one records something non-obvious: they reference
+    vector_db/ and knowledge-base/ by bare relative path, so they need the repo root
+    as the working directory, not notebooks/.
+    
+    Also dropped day2.ipynb's two embedded Plotly outputs, 2.53MB of raw t-SNE
+    coordinate JSON for 7,676 chunks (2.90MB -> 0.02MB). GitHub's notebook viewer
+    doesn't render that mime type, so it was bulk no reader could see, and the live
+    Knowledge Map tab supersedes the visualization anyway. The small text outputs in
+    day1/day3 do render and are kept.
+    
+    .dockerignore and the README's repo-layout section follow the new paths.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit f9a6c45dadfeb5a666cc52e8d1e62ce5f34b1997[m
+Author: Shahid Khan <107818138+ShahidHKhan@users.noreply.github.com>
+Date:   Sun Sep 27 16:35:26 2026 -0400
+
+    Declare tqdm + langchain-core, drop nine unused dependencies
+    
+    Two direct imports were never declared and only resolved transitively, which
+    made them silent time bombs: implementation/ingest.py imports tqdm (reached in
+    production by refresh_kb.py -> implementation.ingest, so the weekly Actions run
+    depended on it) and implementation/answer.py imports langchain_core.messages
+    (reached by app.py, so it's in the image). tqdm arrived via gradio and
+    huggingface-hub, langchain_core via langchain-google-genai. Removing the unused
+    packages below would have broken the first one outright -- declaring both
+    explicitly is what makes that cleanup safe.
+    
+    Removed as imported by nothing at all: langchain-openai, langchain-huggingface,
+    langchain-community, langchain-text-splitters, openai, tiktoken, nbformat, and
+    google-genai (the code reaches Gemini through langchain-google-genai, which
+    still pulls google-genai itself). These were leftovers from the tutorial
+    scaffold the project started from.
+    
+    langchain-chroma was also unused as an import -- it was only present to pull in
+    chromadb, which two non-production scripts do import directly. So chromadb is
+    now a dev dependency, declared as what's actually imported. Both workflows and
+    the Dockerfile install with --no-dev, so it no longer reaches production at all.
+    
+    Net: 174 -> 159 resolved packages, and a smaller image.
+    
+    Verified against the production install (uv sync --frozen --no-dev, exactly what
+    CI and Docker do): app, refresh_kb, visualize_embeddings, all three
+    implementation modules and both scraper modules import cleanly, and
+    tests/test_refresh_kb.py + tests/test_app.py are 26/26.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+[33mcommit ef7da2ec595b54ef0a35585e6ca5711ab0629fb4[m
+Author: Shahid Khan <107818138+ShahidHKhan@users.noreply.github.com>
+Date:   Sun Sep 27 16:32:35 2026 -0400
+
+    Remove stale and unreferenced files from the repo root
+    
+    requirements.txt pinned psycopg2-binary, which has been wrong since the
+    psycopg3 migration (b1014b6). Nothing consumed it -- the Dockerfile and both
+    workflows install via `uv sync` -- so it could only mislead someone setting up
+    the project by hand.
+    
+    check_embedd

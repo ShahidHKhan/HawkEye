@@ -84,8 +84,28 @@ def fetch_documents() -> list[dict]:
     return documents
 
 
-llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0)
+# timeout is per HTTP attempt: a normal chunking call takes ~5s, while a prompt Gemini
+# gets stuck on hangs ~2 minutes before it 500s. max_retries=1 leaves retrying to the
+# tenacity @retry on process_document -- the client's own default of 6 attempts stacked
+# underneath it, which turned one stuck article into an hour of a refresh run.
+LLM_TIMEOUT_SECONDS = 90
+llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0, timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
 wait = wait_exponential(multiplier=1, min=10, max=240)
+
+
+def prompt_source(source: str) -> str:
+    """
+    The source path as the chunking prompt shows it, relative to knowledge-base/. The
+    stored source is an absolute path from whichever machine last ran ingest, which tells
+    the model nothing -- and article 42989's (D:/mrsha/Projects/...) reliably made Gemini
+    hang and 500 on every attempt, while the same prompt with a relative path chunked in ~5s.
+    """
+    normalized = source.replace("\\", "/")
+    marker = "knowledge-base/"
+    idx = normalized.lower().find(marker)
+    if idx != -1:
+        return normalized[idx + len(marker):]
+    return normalized.split("/")[-1]
 
 
 def make_prompt(document: dict) -> str:
@@ -95,7 +115,7 @@ You take a document and split it into overlapping chunks for a KnowledgeBase.
 
 The document is from the IT knowledge base of SUNY New Paltz.
 The document is of type: {document["type"]}
-The document has been retrieved from: {document["source"]}
+The document has been retrieved from: {prompt_source(document["source"])}
 
 An IT help-desk assistant will use these chunks to answer technician questions.
 You should divide up the document as you see fit, being sure that the entire document
