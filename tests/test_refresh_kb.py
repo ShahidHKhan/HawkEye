@@ -137,6 +137,84 @@ def test_chunking_prompt_never_carries_a_machine_path():
     assert prompt_source("somewhere/else/file-1.md") == "file-1.md"
 
 
+def test_looped_chunk_is_rejected_not_stored():
+    """Article 156931 was stored with a 1,024,995-char chunk of dashes."""
+    from implementation.ingest import Chunk, check_chunks
+
+    document = {"type": "Internal-Documentation", "source": "x.md", "text": "a" * 3567}
+    fine = Chunk(headline="h", summary="s", original_text="a" * 3567)
+    check_chunks([fine], document)  # a chunk may be the whole document
+
+    looped = Chunk(headline="h", summary="s", original_text="-" * 1_024_995)
+    try:
+        check_chunks([fine, looped], document)
+    except ValueError as e:
+        assert "looped" in str(e), e
+    else:
+        raise AssertionError("a chunk longer than its document must be rejected")
+
+
+@contextmanager
+def chunker_that_always_fails(exc):
+    """Stand in for chunk_with_llm once all its retries are spent, failing with exc."""
+    from tenacity import Future, RetryError
+    import implementation.ingest as ingest
+
+    def failing(document):
+        attempt = Future(5)
+        attempt.set_exception(exc)
+        raise RetryError(attempt)
+
+    original = ingest.chunk_with_llm
+    ingest.chunk_with_llm = failing
+    try:
+        yield ingest
+    finally:
+        ingest.chunk_with_llm = original
+
+
+def unchunkable_500():
+    from google.genai.errors import ServerError
+    return ServerError(500, {"error": {"code": 500, "message": "internal", "status": "INTERNAL"}})
+
+
+def test_short_unchunkable_document_is_stored_whole():
+    """32121, 67137 and 169560: Gemini 500s on every attempt, at temperature 0."""
+    with chunker_that_always_fails(unchunkable_500()) as ingest:
+        document = {
+            "type": "Networking-WiFi",
+            "source": "D:/x/knowledge-base/Networking-WiFi/Google-Chrome-Pop-up-Blocker-Settings-32121.md",
+            "title": "Google Chrome: Pop-up Blocker Settings",
+            "text": "To allow pop-ups, open Settings.\n",
+        }
+        [chunk] = ingest.process_document(document)
+        assert chunk.page_content == "Google Chrome: Pop-up Blocker Settings\n\nTo allow pop-ups, open Settings."
+        assert chunk.metadata == {"source": document["source"], "type": "Networking-WiFi"}
+
+        del document["title"]  # a full ingest has no title; fall back to the filename
+        [chunk] = ingest.process_document(document)
+        assert chunk.page_content.startswith("Google Chrome Pop up Blocker Settings\n\n"), chunk.page_content
+
+
+def test_long_or_otherwise_failing_documents_still_raise():
+    """An outage or a bad key must fail loudly, not quietly store whole articles."""
+    from tenacity import RetryError
+
+    short = {"type": "t", "source": "s-1.md", "text": "body"}
+    long = {"type": "t", "source": "s-1.md", "text": "x" * 4001}
+    for exc, document in (
+        (unchunkable_500(), long),
+        (PermissionError("API key not valid"), short),
+    ):
+        with chunker_that_always_fails(exc) as ingest:
+            try:
+                ingest.process_document(document)
+            except RetryError:
+                pass
+            else:
+                raise AssertionError(f"{type(exc).__name__} on a {len(document['text'])}-char doc must raise")
+
+
 # --- circuit breaker -------------------------------------------------------
 
 def test_removal_safety_threshold():

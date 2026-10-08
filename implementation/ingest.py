@@ -4,11 +4,13 @@ import re
 from multiprocessing import Pool
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
+from google.genai.errors import ServerError
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
 load_dotenv(override=True)
@@ -20,6 +22,9 @@ AVERAGE_CHUNK_SIZE = 500  # chars — tune later if chunks come out too big/smal
 
 WORKERS = 3  # keep low for Gemini rate limits
 EMBED_BATCH_SIZE = 50  # keep small to avoid rate limits
+# Longest document process_document will store whole when Gemini can't chunk it. About
+# twice the largest LLM-made chunk -- still one coherent thing for retrieval to match.
+FALLBACK_MAX_CHARS = 4000
 
 BASE64_IMAGE_PATTERN = re.compile(r'!\[[^\]]*\]\(data:image/[^;]+;base64,[^)]+\)')
 
@@ -137,11 +142,73 @@ Respond with the chunks.
 
 
 @retry(wait=wait, stop=stop_after_attempt(5))
-def process_document(document: dict) -> list[Result]:
+def chunk_with_llm(document: dict) -> list[Result]:
     structured_llm = llm.with_structured_output(Chunks)
     prompt = make_prompt(document)
     reply = structured_llm.invoke(prompt)
+    check_chunks(reply.chunks, document)
     return [chunk.as_result(document) for chunk in reply.chunks]
+
+
+def process_document(document: dict) -> list[Result]:
+    """
+    Chunk a document with the LLM, falling back to storing it whole as a single chunk
+    when Gemini won't chunk it and it's short enough to be one.
+
+    Some prompts make Gemini hang and 500 (or time out) on every attempt, and some make
+    it loop -- deterministically, at temperature 0, so retrying never helps. Articles
+    32121, 67137 and 169560 did this and couldn't be re-chunked at all. The fallback is
+    deliberately narrow: only those failure modes and only short documents, so a real
+    outage or a bad API key still fails loudly instead of quietly storing whole articles.
+    """
+    try:
+        return chunk_with_llm(document)
+    except RetryError as e:
+        cause = e.last_attempt.exception()
+        if not isinstance(cause, UNCHUNKABLE_ERRORS) or len(document["text"]) > FALLBACK_MAX_CHARS:
+            raise
+        print(
+            f"WARNING: Gemini could not chunk {prompt_source(document['source'])} "
+            f"({type(cause).__name__}); storing it whole as a single chunk."
+        )
+        return [whole_document_chunk(document)]
+
+
+def whole_document_chunk(document: dict) -> Result:
+    """The whole document as one chunk, headed by its title, the way an LLM chunk is."""
+    filename = prompt_source(document["source"]).split("/")[-1]
+    title = document.get("title") or re.sub(r"-\d+\.md$", "", filename).replace("-", " ")
+    return Result(
+        page_content=title + "\n\n" + document["text"].strip(),
+        metadata={"source": document["source"], "type": document["type"]},
+    )
+
+
+class LoopedChunkError(ValueError):
+    """The model returned a chunk longer than the document it was splitting."""
+
+
+# What a prompt Gemini can't chunk looks like once every retry is spent: a hang that
+# ends in a 500 or in our own timeout, or a reply that looped.
+UNCHUNKABLE_ERRORS = (ServerError, httpx.TimeoutException, LoopedChunkError)
+
+
+def check_chunks(chunks: list[Chunk], document: dict) -> None:
+    """
+    Reject a reply where some chunk's original_text is longer than the whole document,
+    which no honest split can produce. It's the signature of the model looping on one
+    token: article 156931 came back with a 1,024,995-char chunk that was almost entirely
+    dashes from a table underline, and was stored and embedded as-is. Raising makes
+    the @retry on chunk_with_llm try again, and if every attempt loops, process_document
+    stores a short document whole and fails a long one -- never the garbage.
+    """
+    limit = len(document["text"]) + 500  # slack for whitespace/markdown the model normalizes
+    for chunk in chunks:
+        if len(chunk.original_text) > limit:
+            raise LoopedChunkError(
+                f"chunk original_text is {len(chunk.original_text):,} chars, longer than the "
+                f"{len(document['text']):,}-char document -- the model looped; refusing to store it"
+            )
 
 
 def create_chunks(documents: list[dict]) -> list[Result]:

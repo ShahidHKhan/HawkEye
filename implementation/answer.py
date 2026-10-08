@@ -29,7 +29,12 @@ db_pool = ConnectionPool(
 )
 
 embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
-llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0)
+# Same reasoning as ingest.py: the @retry decorators below own retrying, so the
+# client's own default of 6 attempts would only stack underneath them -- here that
+# means a technician waiting minutes for an answer while Gemini is unhealthy.
+# 60s per attempt is far above what a rerank or a streamed answer normally takes.
+LLM_TIMEOUT_SECONDS = 60
+llm = ChatGoogleGenerativeAI(model=MODEL, temperature=0, timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
 
 SYSTEM_PROMPT_TEMPLATE = """
 You are an internal knowledge assistant for IT Help Desk technicians at SUNY New Paltz.

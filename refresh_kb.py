@@ -146,7 +146,12 @@ def process_changed_article(article: dict, scope: str) -> dict:
     known_source, known_type = existing_chunk_identity(article_id, category)
     source = known_source or local_path.as_posix()
     doc_type = known_type or category or "Uncategorized"
-    document = {"type": doc_type, "source": source, "text": strip_embedded_images(article.get("body", ""))}
+    document = {
+        "type": doc_type,
+        "source": source,
+        "title": article.get("title"),
+        "text": strip_embedded_images(article.get("body", "")),
+    }
 
     chunks = process_document(document)
     vectors = embed_batch([c.page_content for c in chunks])
@@ -192,6 +197,7 @@ def process_new_article(article: dict, scope: str) -> dict:
     document = {
         "type": category,
         "source": local_path.as_posix(),
+        "title": article.get("title"),
         "text": strip_embedded_images(article.get("body", "")),
     }
     chunks = process_document(document)
