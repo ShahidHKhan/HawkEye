@@ -23,6 +23,11 @@ jobs:
       # through a dev or transitive dependency.
       - run: uv sync --frozen --no-dev
 
+      # The steps below run through `uv run --no-sync` because uv sync installs into
+      # .venv, not into the interpreter setup-python puts on PATH -- a bare `python`
+      # here has none of the dependencies. --no-sync uses .venv exactly as synced
+      # above; a plain `uv run` would re-sync and pull the dev group back in.
+
       # Deliberately given no secrets. Both suites setdefault() placeholder
       # SUPABASE_DB_URL / GOOGLE_API_KEY values before importing (the
       # implementation modules build a connection pool and a Gemini client at
@@ -31,15 +36,15 @@ jobs:
       # database. See tests/README.md.
       - name: Offline tests
         run: |
-          python tests/test_refresh_kb.py
-          python tests/test_app.py
+          uv run --no-sync python tests/test_refresh_kb.py
+          uv run --no-sync python tests/test_app.py
 
       # Guards the entry points the two suites don't import: a broken
       # visualize_embeddings or scraper module would otherwise only surface on
       # deploy, or in the weekly refresh run.
       - name: Import check
         run: |
-          python -c "
+          uv run --no-sync python -c "
           import importlib, os, sys
           os.environ['SUPABASE_DB_URL'] = 'postgresql://placeholder/unused'
           os.environ['GOOGLE_API_KEY'] = 'placeholder-unused'

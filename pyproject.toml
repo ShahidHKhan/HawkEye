@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 dependencies = [
     # App + retrieval pipeline
     "gradio>=6.20.0",
+    "google-genai>=2.11.0",  # ingest.py catches its ServerError directly
+    "httpx>=0.28.1",  # ...and httpx's TimeoutException
     "langchain-core>=1.2.0",
     "langchain-google-genai>=4.2.7",
     "psycopg[binary,pool]>=3.3.4",
