@@ -38,6 +38,8 @@ jobs:
         run: |
           uv run --no-sync python tests/test_refresh_kb.py
           uv run --no-sync python tests/test_app.py
+          uv run --no-sync python tests/test_accounts.py
+          uv run --no-sync python tests/test_rate_limit.py
 
       # Guards the entry points the two suites don't import: a broken
       # visualize_embeddings or scraper module would otherwise only surface on
@@ -51,7 +53,9 @@ jobs:
           sys.path.insert(0, os.getcwd())
           for m in ['app', 'refresh_kb', 'visualize_embeddings',
                     'implementation.answer', 'implementation.ingest',
-                    'implementation.diff_articles',
+                    'implementation.diff_articles', 'implementation.db',
+                    'implementation.accounts', 'implementation.audit',
+                    'implementation.rate_limit', 'scripts.manage_users',
                     'scraper.scrape_kb', 'scraper.convert_to_markdown']:
               importlib.import_module(m)
               print('ok', m)

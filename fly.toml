@@ -17,6 +17,14 @@ primary_region = 'yyz'
   min_machines_running = 1
   processes = ['app']
 
+  # Edge backstop in front of the app's own rate limits: past the soft limit Fly
+  # prefers other machines (when there are any), past the hard limit it queues
+  # requests instead of handing this 1 GB machine more than it can hold.
+  [http_service.concurrency]
+    type = 'requests'
+    soft_limit = 50
+    hard_limit = 100
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'

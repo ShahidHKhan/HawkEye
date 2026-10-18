@@ -1,6 +1,9 @@
 """
-Offline tests for the Refresh History tab's rendering. No database: every run
-here is a hand-written changes payload of the shape refresh_kb.py logs.
+Offline tests for app.py: the Refresh History tab's rendering, role checks on
+every admin handler, and the question flow (validation, one-at-a-time, quotas,
+start/finish logging). No database or model: refresh runs are hand-written
+changes payloads of the shape refresh_kb.py logs, and everything chat_stream
+calls out to is stubbed.
 
     python tests/test_app.py
 """
@@ -110,6 +113,250 @@ def test_summary_table_still_has_nine_columns():
     assert all(len(row) == len(app.REFRESH_RUNS_HEADERS) for row in formatted)
     assert [row[7] for row in formatted] == ["Failed", "Success", "Running"]
     assert formatted[2][1] == "—", "an unfinished run shows a dash, not a crash"
+
+
+# --- accounts, roles, and the question flow --------------------------------------
+
+import gradio as gr  # noqa: E402
+
+from implementation.accounts import User  # noqa: E402
+from implementation.rate_limit import RateLimited  # noqa: E402
+
+ADMIN = User(id=1, username="khans45", role="admin", is_active=True)
+WORKER = User(id=3, username="jdoe12", role="worker", is_active=True)
+
+
+class FakeRequest:
+    def __init__(self, username="jdoe12"):
+        self.username = username
+        self.headers = {"user-agent": "test"}
+        self.client = None
+        self.session_hash = "session-1"
+
+
+class Stubs:
+    """Swap module attributes for the length of a test, then put them back."""
+
+    def __init__(self):
+        self._saved = []
+
+    def set(self, obj, name, value):
+        self._saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def restore(self):
+        for obj, name, value in reversed(self._saved):
+            setattr(obj, name, value)
+
+
+def signed_in_as(stubs, user):
+    stubs.set(app.accounts, "current_user", lambda request: user)
+    events = []
+    stubs.set(app.audit, "record_event", lambda event_type, **kw: events.append((event_type, kw)))
+    return events
+
+
+def expect_gr_error(fn) -> str:
+    try:
+        fn()
+    except gr.Error as e:
+        return str(e)
+    raise AssertionError("expected gr.Error")
+
+
+def test_workers_are_refused_by_every_admin_handler():
+    """Tabs are hidden from workers, but the handlers are callable directly -- they must check."""
+    stubs = Stubs()
+    events = signed_in_as(stubs, WORKER)
+    app.rate_limit.audit_noise_limiter._hits.clear()
+    try:
+        request = FakeRequest()
+        for call in (
+            lambda: app.on_refresh_history(request),
+            lambda: app.on_run_selected([], FakeSelect(0), request),
+            lambda: app.on_kb_map(request),
+            lambda: app.on_accounts_tab(request),
+            lambda: app.on_create_account("newuser1", "admin", request),
+            lambda: app.on_bulk_create("a1\nb2", request),
+            lambda: app.manage_account("admin", "jdoe12", request),
+            lambda: app.on_activity("24 hours", "", request),
+        ):
+            assert "admins only" in expect_gr_error(call)
+    finally:
+        stubs.restore()
+    assert events and all(event == "access_denied" for event, _ in events)
+
+
+def test_signed_out_requests_are_refused():
+    stubs = Stubs()
+    signed_in_as(stubs, None)
+    try:
+        assert "session has ended" in expect_gr_error(lambda: app.on_refresh_history(FakeRequest("ghost")))
+        assert "session has ended" in expect_gr_error(lambda: app.require_user(FakeRequest("ghost")))
+    finally:
+        stubs.restore()
+
+
+def test_admin_can_use_admin_handlers():
+    stubs = Stubs()
+    signed_in_as(stubs, ADMIN)
+    try:
+        state = [{"error": None, "changes": {"new": [{"article_id": "1", "title": "First"}]}}]
+        assert "First" in app.on_run_selected(state, FakeSelect(0), FakeRequest("khans45"))
+    finally:
+        stubs.restore()
+
+
+def test_page_load_shows_admin_tabs_only_to_admins():
+    stubs = Stubs()
+    try:
+        signed_in_as(stubs, ADMIN)
+        banner, *tabs = app.on_page_load(FakeRequest("khans45"))
+        assert "khans45@newpaltz.edu" in banner and all(t["visible"] for t in tabs)
+        signed_in_as(stubs, WORKER)
+        banner, *tabs = app.on_page_load(FakeRequest())
+        assert "worker" in banner and not any(t["visible"] for t in tabs)
+    finally:
+        stubs.restore()
+
+
+def question_stubs(answer_stream, quota=lambda user: None):
+    """Stub everything chat_stream touches outside itself; returns (stubs, record)."""
+    stubs = Stubs()
+    record = {"started": [], "finished": [], "events": []}
+
+    def start(user, question, history_length, session):
+        record["started"].append((user.id, question, session))
+        return 42
+
+    def finish(query_id, status, answer, sources, latency, error):
+        record["finished"].append((query_id, status, answer, error))
+
+    stubs.set(app.rate_limit, "check_question_quota", quota)
+    stubs.set(app, "start_query", start)
+    stubs.set(app, "finish_query", finish)
+    stubs.set(app, "answer_question_stream", answer_stream)
+    stubs.set(app.audit, "record_event", lambda event_type, **kw: record["events"].append(event_type))
+    app.rate_limit.question_guard._held.clear()
+    app.rate_limit.audit_noise_limiter._hits.clear()
+    return stubs, record
+
+
+class FakeChunk:
+    page_content = "Restart the router."
+    metadata = {"source": "knowledge-base/Network/wifi.md"}
+
+
+def streaming_answer(question, history):
+    yield "Restart", [FakeChunk()]
+    yield "Restart the router.", [FakeChunk()]
+
+
+def test_completed_question_is_logged_start_and_finish():
+    stubs, record = question_stubs(streaming_answer)
+    try:
+        outputs = list(app.chat_stream("wifi down", [], WORKER, FakeRequest()))
+    finally:
+        stubs.restore()
+    assert outputs[-1][0] == "Restart the router." and outputs[-1][2] == 42
+    assert record["started"] == [(3, "wifi down", "session-1")]
+    assert record["finished"] == [(42, "completed", "Restart the router.", None)]
+    assert 3 not in app.rate_limit.question_guard._held
+
+
+def test_abandoned_question_is_still_recorded():
+    """Closing the tab mid-answer used to skip logging entirely."""
+    stubs, record = question_stubs(streaming_answer)
+    try:
+        stream = app.chat_stream("wifi down", [], WORKER, FakeRequest())
+        next(stream)
+        stream.close()
+    finally:
+        stubs.restore()
+    assert record["finished"] == [(42, "abandoned", "Restart", None)]
+    assert 3 not in app.rate_limit.question_guard._held
+
+
+def test_pipeline_error_is_logged_and_friendly():
+    def broken(question, history):
+        raise TimeoutError("gemini timed out")
+        yield  # pragma: no cover
+
+    stubs, record = question_stubs(broken)
+    try:
+        outputs = list(app.chat_stream("wifi down", [], WORKER, FakeRequest()))
+    finally:
+        stubs.restore()
+    assert outputs[-1][0] == app.FRIENDLY_ERROR
+    assert record["finished"] == [(42, "error", None, "gemini timed out")]
+
+
+def test_rate_limited_question_never_reaches_the_model():
+    def over_quota(user):
+        raise RateLimited("user_minute", retry_after=40, limit=5, period="minute")
+
+    stubs, record = question_stubs(streaming_answer, quota=over_quota)
+    try:
+        outputs = list(app.chat_stream("wifi down", [], WORKER, FakeRequest()))
+    finally:
+        stubs.restore()
+    assert outputs == [("You've reached the limit of 5 questions per minute. Try again in 40 seconds.",
+                        "*No sources: this question wasn't run.*", None)]
+    assert record["started"] == [] and record["events"] == ["rate_limited"]
+    assert 3 not in app.rate_limit.question_guard._held
+
+
+def test_second_question_while_one_is_streaming_is_refused():
+    stubs, record = question_stubs(streaming_answer)
+    try:
+        first = app.chat_stream("wifi down", [], WORKER, FakeRequest())
+        next(first)
+        second = list(app.chat_stream("printer jam", [], WORKER, FakeRequest()))
+        assert "still answering your previous question" in second[0][0]
+        list(first)
+        assert len(list(app.chat_stream("printer jam", [], WORKER, FakeRequest()))) == 2
+    finally:
+        stubs.restore()
+
+
+def test_oversized_and_empty_questions_are_refused_before_anything_runs():
+    stubs, record = question_stubs(streaming_answer)
+    try:
+        long_out = list(app.chat_stream("x" * (app.MAX_QUESTION_CHARS + 1), [], WORKER, FakeRequest()))
+        empty_out = list(app.chat_stream("   ", [], WORKER, FakeRequest()))
+    finally:
+        stubs.restore()
+    assert "the limit is" in long_out[0][0]
+    assert empty_out[0][0] == "Type a question first."
+    assert record["started"] == []
+
+
+def test_only_recent_history_is_sent_to_the_pipeline():
+    seen = {}
+
+    def capture(question, history):
+        seen["history"] = history
+        yield "ok", []
+
+    stubs, record = question_stubs(capture)
+    history = [{"role": "user", "content": str(i)} for i in range(25)]
+    try:
+        list(app.chat_stream("follow-up", history, WORKER, FakeRequest()))
+    finally:
+        stubs.restore()
+    assert len(seen["history"]) == app.MAX_HISTORY_MESSAGES
+    assert seen["history"][-1]["content"] == "24"
+
+
+def test_bulk_results_summarize_each_line():
+    rendered = app.format_bulk_results([("jdoe12", True, "created jdoe12"), ("bad name", False, "invalid")])
+    assert rendered.startswith("**1 of 2 created.**")
+    assert "- Skipped `bad name`: invalid" in rendered
+
+
+def test_activity_summary_names_its_scope():
+    assert "everyone" in app.format_activity_summary((3, 2, 1, 0, 4, 5), "24 hours", None)
+    assert "**jdoe12**" in app.format_activity_summary((3, 1, 0, 0, 0, 0), "7 days", "jdoe12")
 
 
 if __name__ == "__main__":

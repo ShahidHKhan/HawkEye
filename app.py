@@ -1,17 +1,45 @@
+import json
+import logging
 import os
 import time
+from contextlib import closing
 
+import anyio
 import gradio as gr
+import uvicorn
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from psycopg.types.json import Jsonb
 
+from implementation import accounts, audit, rate_limit
+from implementation.accounts import AccountError, User
 from implementation.answer import answer_question_stream, db_pool
+from implementation.rate_limit import RateLimited
 from visualize_embeddings import build_figure, fetch_chunks, reduce_to_3d
 
 ASSISTANT_AVATAR = "static/hawkeye-icon.svg"
 FAVICON = "static/hawkeye-icon.svg"
 
 load_dotenv(override=True)
+
+log = logging.getLogger("hawkeye")
+
+# Longest question accepted, and how much of the conversation is sent along with
+# it. Both bound what one request can cost in Gemini tokens; the full history
+# length is still logged.
+MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", 1500))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 10))
+
+CONTEXT_PLACEHOLDER = "*Retrieved context will appear here*"
+FRIENDLY_ERROR = (
+    "Something went wrong reaching the knowledge base or the model just now. "
+    "Try again in a moment — this has been logged."
+)
+SESSION_ENDED = (
+    "Your session has ended or your account was disabled. Sign out and sign in again, "
+    "or ask a HawkEye admin."
+)
 
 # Shared across every technician's session -- the embedding map is the same
 # knowledge base for everyone, so one person pays the ~1-2 minute PCA/t-SNE
@@ -40,35 +68,111 @@ def normalize_history(hist: list[dict]) -> list[dict]:
     return [{"role": m["role"], "content": extract_text(m["content"])} for m in hist]
 
 
-def log_query(question: str, history: list[dict], answer: str | None,
-              sources: list[str] | None, latency: float, error: str | None) -> None:
+# ---------------------------------------------------------------------------
+# Who is asking: identity and role checks for every handler
+# ---------------------------------------------------------------------------
+#
+# Hiding a tab from workers is only cosmetic: every Gradio event can be called
+# directly over its HTTP API by anyone signed in, whatever the page shows. So
+# each handler resolves the account behind the request itself and refuses
+# anything its role doesn't allow.
+
+def audit_refusal(event_type: str, request, user: User | None, details: dict) -> None:
+    """Record an access_denied / rate_limited event, capped per user so refusals can't flood the log."""
+    ip, agent = audit.request_context(request)
+    key = (event_type, user.id if user else ip or "unknown")
+    if rate_limit.audit_noise_limiter.hit(key) is not None:
+        return
+    typed = getattr(request, "username", None) if request is not None else None
+    audit.record_event(
+        event_type,
+        user_id=user.id if user else None,
+        username=user.username if user else (accounts.normalize_username(typed) or typed),
+        details=details, ip=ip, agent=agent,
+    )
+
+
+def require_user(request) -> User:
+    user = accounts.current_user(request)
+    if user is None:
+        raise gr.Error(SESSION_ENDED)
+    return user
+
+
+def require_admin(request, action: str, *, count_action: bool = True) -> User:
+    """
+    The signed-in admin, or a gr.Error. `count_action` charges the admin action
+    limiter; it's off for handlers that only re-render data already on the page.
+    """
+    user = accounts.current_user(request)
+    if user is None or not user.is_admin:
+        audit_refusal("access_denied", request, user, {"action": action})
+        raise gr.Error(SESSION_ENDED if user is None else "That part of HawkEye is for admins only.")
+    if count_action:
+        try:
+            rate_limit.check(
+                rate_limit.admin_action_limiter, user.id, "admin_actions",
+                "That's a lot of admin actions in a short time.",
+            )
+        except RateLimited as refusal:
+            audit_refusal("rate_limited", request, user, {**refusal.audit_details(), "action": action})
+            raise gr.Error(refusal.user_message())
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Query and feedback logging
+# ---------------------------------------------------------------------------
+
+def start_query(user: User, question: str, history_length: int, session_id: str | None) -> int:
+    """
+    Log the question the moment it's asked, before any model call. Inserting up
+    front is what makes the per-user quota count in-flight questions too, and it
+    means a question is on record even if the technician closes the tab before
+    the answer finishes (finish_query then marks it 'abandoned').
+    """
     with db_pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
+        row = conn.execute(
+            """
+            INSERT INTO queries (question, history_length, user_id, session_id, status)
+            VALUES (%s, %s, %s, %s, 'in_progress')
+            RETURNING id
+            """,
+            (question, history_length, user.id, session_id),
+        ).fetchone()
+    return row[0]
+
+
+def finish_query(query_id: int, status: str, answer: str | None, sources: list[str] | None,
+                 latency: float, error: str | None) -> None:
+    """Close out a start_query row. Never raises: it also runs while a stream is being torn down."""
+    try:
+        with db_pool.connection() as conn:
+            conn.execute(
                 """
-                INSERT INTO queries (question, history_length, answer, sources, latency_seconds, error)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                UPDATE queries
+                SET status = %s, answer = %s, sources = %s, latency_seconds = %s, error = %s
+                WHERE id = %s
                 """,
                 (
-                    question,
-                    len(history),
+                    status,
                     answer,
                     Jsonb(sources) if sources is not None else None,
                     round(latency, 2),
                     error,
+                    query_id,
                 ),
             )
-        conn.commit()
+    except Exception:
+        log.exception("Failed to finish query %s as %s", query_id, status)
 
 
-def log_feedback(answer: str, liked: bool) -> None:
+def log_feedback(answer: str, liked: bool, user_id: int | None = None, query_id: int | None = None) -> None:
     with db_pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO feedback (answer, liked) VALUES (%s, %s)",
-                (answer, liked),
-            )
-        conn.commit()
+        conn.execute(
+            "INSERT INTO feedback (answer, liked, user_id, query_id) VALUES (%s, %s, %s, %s)",
+            (answer, liked, user_id, query_id),
+        )
 
 
 def clean_source(source: str) -> str:
@@ -229,69 +333,420 @@ def load_kb_map(progress=gr.Progress()):
     )
 
 
-def chat_stream(message: str, history: list[dict]):
+def on_refresh_history(request: gr.Request):
+    require_admin(request, "refresh_history")
+    return load_refresh_runs()
+
+
+def on_run_selected(run_details: list, evt: gr.SelectData, request: gr.Request) -> str:
+    # Re-renders data already in the page's state, so no database hit to rate limit.
+    require_admin(request, "refresh_history", count_action=False)
+    return show_run_details(run_details, evt)
+
+
+def on_kb_map(request: gr.Request, progress=gr.Progress()):
+    require_admin(request, "knowledge_map")
+    return load_kb_map(progress)
+
+
+# ---------------------------------------------------------------------------
+# Assistant: the question flow
+# ---------------------------------------------------------------------------
+
+def _refuse(user: User, refusal: RateLimited, request=None):
+    audit_refusal("rate_limited", request, user, {**refusal.audit_details(), "surface": "question"})
+    yield refusal.user_message(), "*No sources: this question wasn't run.*", None
+
+
+def chat_stream(message: str, history: list[dict], user: User, request=None):
     """
-    Streaming version of the production pipeline: yields (partial_answer, context)
-    as the answer streams in. Logs exactly once, after the stream finishes
-    (success or failure); never lets a raw exception reach the technician's screen.
+    Streaming version of the production pipeline: yields (partial_answer, context,
+    query_id) as the answer streams in. In order: validate the question, take the
+    user's one-at-a-time slot, check their quota, log the question, stream the
+    answer, then record how it ended -- completed, error, or abandoned if the
+    technician left mid-answer. Never lets a raw exception reach the screen.
     """
-    start = time.time()
-    docs = []
-    answer = ""
+    message = (message or "").strip()
+    if not message:
+        yield "Type a question first.", CONTEXT_PLACEHOLDER, None
+        return
+    if len(message) > MAX_QUESTION_CHARS:
+        yield (
+            f"That question is {len(message):,} characters; the limit is {MAX_QUESTION_CHARS:,}. "
+            "Trim it to the customer's actual issue and try again.",
+            CONTEXT_PLACEHOLDER,
+            None,
+        )
+        return
+
     try:
-        for answer, docs in answer_question_stream(message, history):
-            yield answer, format_context(docs)
-        latency = time.time() - start
-        sources = [chunk.metadata.get("source") for chunk in docs]
-        log_query(message, history, answer, sources, latency, error=None)
+        rate_limit.question_guard.acquire(user.id)
+    except RateLimited as refusal:
+        yield from _refuse(user, refusal, request)
+        return
+    try:
+        yield from _answer(message, history, user, request)
+    finally:
+        rate_limit.question_guard.release(user.id)
+
+
+def _answer(message: str, history: list[dict], user: User, request=None):
+    try:
+        rate_limit.check_question_quota(user)
+    except RateLimited as refusal:
+        yield from _refuse(user, refusal, request)
+        return
+    except Exception:
+        log.exception("Quota check failed for %s", user.username)
+        yield FRIENDLY_ERROR, "*Error retrieving context — this attempt has been logged.*", None
+        return
+
+    start = time.time()
+    try:
+        query_id = start_query(user, message, len(history), getattr(request, "session_hash", None))
+    except Exception:
+        log.exception("Couldn't log the start of a question for %s", user.username)
+        yield FRIENDLY_ERROR, "*Error retrieving context — this attempt has been logged.*", None
+        return
+
+    answer, docs = "", []
+    try:
+        for answer, docs in answer_question_stream(message, history[-MAX_HISTORY_MESSAGES:]):
+            yield answer, format_context(docs), query_id
+    except GeneratorExit:
+        # The technician closed the tab or reset mid-answer. Record what they got.
+        finish_query(query_id, "abandoned", answer or None,
+                     [c.metadata.get("source") for c in docs] if docs else None,
+                     time.time() - start, None)
+        raise
     except Exception as e:
-        latency = time.time() - start
-        log_query(message, history, None, None, latency, error=str(e))
-        friendly = (
-            "Something went wrong reaching the knowledge base or the model just now. "
-            "Try again in a moment — this has been logged."
-        )
-        yield friendly, "*Error retrieving context — this attempt has been logged.*"
+        finish_query(query_id, "error", None, None, time.time() - start, str(e))
+        yield FRIENDLY_ERROR, "*Error retrieving context — this attempt has been logged.*", query_id
+        return
+    finish_query(query_id, "completed", answer, [c.metadata.get("source") for c in docs],
+                 time.time() - start, None)
 
 
-def require_auth_credentials() -> tuple[str, str]:
-    """
-    APP_USERNAME / APP_PASSWORD, or a hard failure.
-
-    Checked here rather than at import time because tests/test_app.py imports this
-    module, and reading the Refresh History helpers shouldn't require the server's
-    credentials -- but launching the server must. Without this, a missing variable
-    made os.getenv return None and Gradio received auth=[(None, None)], standing
-    the app up with a login form in an unclear state instead of refusing to start.
-    For an internal tool reachable on the public internet, failing loudly at boot
-    is the only safe reading of "the password variable isn't set."
-    """
-    username = os.getenv("APP_USERNAME")
-    password = os.getenv("APP_PASSWORD")
-    missing = [
-        name for name, value in (("APP_USERNAME", username), ("APP_PASSWORD", password))
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(
-            f"{' and '.join(missing)} not set — refusing to start without basic auth. "
-            f"Add them to your .env file (see .env.example), or to the host's secrets "
-            f"when deploying."
-        )
-    return username, password
+def put_message_in_chatbot(msg, hist):
+    if not (msg or "").strip():
+        return msg, hist
+    return "", hist + [{"role": "user", "content": msg}]
 
 
-def main():
-    username, password = require_auth_credentials()
-    theme = gr.themes.Soft(
-        primary_hue="blue", secondary_hue="slate", font=["Inter", "system-ui", "sans-serif"]
+def respond(hist, query_ids, request: gr.Request):
+    user = require_user(request)
+    hist = normalize_history(hist)
+    query_ids = dict(query_ids or {})
+    if not hist or hist[-1]["role"] != "user":
+        yield hist, gr.update(), query_ids
+        return
+    last_message = hist[-1]["content"]
+    prior = hist[:-1]
+    hist.append({"role": "assistant", "content": "_Searching the knowledge base…_"})
+    assistant_index = len(hist) - 1
+    yield hist, "*Retrieving context…*", query_ids
+    # closing(): if this generator is torn down mid-stream, chat_stream is closed
+    # right away (and logs the question as abandoned) instead of whenever it's
+    # garbage collected.
+    with closing(chat_stream(last_message, prior, user, request)) as stream:
+        for partial_answer, context, query_id in stream:
+            hist[-1]["content"] = partial_answer
+            if query_id is not None:
+                query_ids[assistant_index] = query_id
+            yield hist, context, query_ids
+
+
+def on_like(query_ids, evt: gr.LikeData, request: gr.Request):
+    """Thumbs up/down, tied to the account and to the exact question it rates."""
+    user = require_user(request)
+    try:
+        rate_limit.check(rate_limit.feedback_limiter, user.id, "feedback", "That's a lot of feedback clicks.")
+    except RateLimited as refusal:
+        audit_refusal("rate_limited", request, user, {**refusal.audit_details(), "surface": "feedback"})
+        gr.Warning(refusal.user_message())
+        return
+    index = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    log_feedback(
+        answer=extract_text(evt.value), liked=bool(evt.liked),
+        user_id=user.id, query_id=(query_ids or {}).get(index),
     )
+
+
+# ---------------------------------------------------------------------------
+# Accounts tab (admins)
+# ---------------------------------------------------------------------------
+
+USERS_HEADERS = [
+    "Username", "Email", "Role", "Active", "Created", "Last sign-in (ET)",
+    "Questions (7d)", "Last question (ET)",
+]
+USERS_DATATYPES = ["str", "str", "str", "str", "str", "str", "number", "str"]
+
+
+def format_users(rows: list[tuple]) -> list[list]:
+    return [
+        [username, email, role, "yes" if active else "no", created or "", last_login or "—",
+         queries_7d, last_query or "—"]
+        for username, email, role, active, created, last_login, queries_7d, last_query in rows
+    ]
+
+
+def users_outputs():
+    rows = format_users(accounts.list_users())
+    return rows, gr.update(choices=[row[0] for row in rows])
+
+
+def on_accounts_tab(request: gr.Request):
+    require_admin(request, "accounts")
+    return users_outputs()
+
+
+def password_note(role: str) -> str:
+    return "the shared admin password" if role == "admin" else "the shared worker password"
+
+
+def on_create_account(username: str, role: str, request: gr.Request):
+    admin = require_admin(request, "create_account")
+    try:
+        rate_limit.check(rate_limit.account_creation_limiter, admin.id, "account_creation",
+                         "That's the hourly limit on new accounts.")
+        user = accounts.create_user(admin, username, role)
+    except RateLimited as refusal:
+        audit_refusal("rate_limited", request, admin, refusal.audit_details())
+        return f"**Not created.** {refusal.user_message()}", gr.update(), gr.update(), username
+    except AccountError as e:
+        return f"**Not created.** {e}", gr.update(), gr.update(), username
+    rows, choices = users_outputs()
+    return (
+        f"Created **{user.username}** ({user.email}) as {user.role}. They sign in with "
+        f"`{user.username}` and {password_note(user.role)}.",
+        rows, choices, "",
+    )
+
+
+def format_bulk_results(results: list[tuple[str, bool, str]]) -> str:
+    if not results:
+        return "*Nothing to add: enter one username per line.*"
+    created = sum(1 for _, ok, _ in results if ok)
+    lines = [f"**{created} of {len(results)} created.** New accounts sign in with {password_note('worker')}.", ""]
+    lines += [f"- {'Created' if ok else 'Skipped'} `{entry}`: {message}" for entry, ok, message in results]
+    return "\n".join(lines)
+
+
+def on_bulk_create(text: str, request: gr.Request):
+    admin = require_admin(request, "bulk_create_accounts")
+
+    def creation_budget():
+        retry = rate_limit.account_creation_limiter.hit(admin.id)
+        if retry is not None:
+            raise AccountError(
+                f"hourly limit on new accounts reached; try again in {rate_limit.format_wait(retry)}."
+            )
+
+    results = accounts.bulk_create(admin, text, "worker", budget_check=creation_budget)
+    rows, choices = users_outputs()
+    return format_bulk_results(results), rows, choices
+
+
+def manage_account(action: str, username: str, request) -> tuple:
+    admin = require_admin(request, f"account_{action}")
+    if not username:
+        return "Pick an account first (or click its row in the table).", gr.update(), gr.update()
+    try:
+        if action == "disable":
+            user = accounts.set_active(admin, username, False)
+            message = f"Disabled **{user.username}**. Their open sessions stop working within a minute."
+        elif action == "enable":
+            user = accounts.set_active(admin, username, True)
+            message = f"Enabled **{user.username}**."
+        elif action in ("admin", "worker"):
+            user = accounts.set_role(admin, username, action)
+            message = (f"**{user.username}** is now {'an admin' if action == 'admin' else 'a worker'}. "
+                       f"Their password was reset to {password_note(action)}.")
+        elif action == "reset":
+            user = accounts.reset_password(admin, username)
+            message = (f"Reset **{user.username}**'s password to {password_note(user.role)}. "
+                       "This also clears a sign-in lockout.")
+        else:
+            raise AccountError(f"Unknown action {action!r}.")
+    except AccountError as e:
+        return f"**Not changed.** {e}", gr.update(), gr.update()
+    rows, choices = users_outputs()
+    return message, rows, choices
+
+
+def manage_handler(action: str):
+    # A real function per button (not functools.partial) so Gradio sees the
+    # gr.Request annotation and injects the request.
+    def handler(username: str, request: gr.Request):
+        return manage_account(action, username, request)
+    handler.__name__ = f"manage_{action}"
+    return handler
+
+
+def on_user_row_selected(evt: gr.SelectData, request: gr.Request):
+    require_admin(request, "accounts", count_action=False)
+    row = evt.row_value or []
+    return gr.update(value=row[0]) if row else gr.update()
+
+
+# ---------------------------------------------------------------------------
+# Activity tab (admins)
+# ---------------------------------------------------------------------------
+
+ACTIVITY_RANGES = {"24 hours": "24 hours", "7 days": "7 days", "30 days": "30 days"}
+ACTIVITY_QUERY_HEADERS = ["Time (ET)", "User", "Question", "Status", "Latency (s)", "Sources", "Error"]
+ACTIVITY_USAGE_HEADERS = ["Username", "Role", "Active", "Questions", "Errors", "Last question (ET)", "Last sign-in (ET)"]
+ACTIVITY_SECURITY_HEADERS = ["Time (ET)", "Event", "Account", "By", "IP", "Details"]
+ACTIVITY_ROW_LIMIT = 200
+
+
+def _clip(text: str | None, limit: int) -> str:
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def fetch_activity(range_label: str, username: str | None) -> dict:
+    """Everything the Activity tab shows, for one time range and optionally one user."""
+    interval = ACTIVITY_RANGES.get(range_label, "24 hours")
+    params = {"interval": interval, "username": username}
+    with db_pool.connection() as conn:
+        summary = conn.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM v_query_activity
+                 WHERE created_at > now() - %(interval)s::interval
+                   AND (%(username)s::text IS NULL OR username = %(username)s)),
+                (SELECT count(DISTINCT username) FROM v_query_activity
+                 WHERE created_at > now() - %(interval)s::interval AND username IS NOT NULL
+                   AND (%(username)s::text IS NULL OR username = %(username)s)),
+                (SELECT count(*) FROM v_query_activity
+                 WHERE created_at > now() - %(interval)s::interval AND status = 'error'
+                   AND (%(username)s::text IS NULL OR username = %(username)s)),
+                (SELECT count(*) FROM v_query_activity
+                 WHERE created_at > now() - %(interval)s::interval AND status = 'abandoned'
+                   AND (%(username)s::text IS NULL OR username = %(username)s)),
+                (SELECT count(*) FROM v_security_events
+                 WHERE occurred_at > now() - %(interval)s::interval AND event_type = 'rate_limited'
+                   AND (%(username)s::text IS NULL OR username = %(username)s)),
+                (SELECT count(*) FROM v_security_events
+                 WHERE occurred_at > now() - %(interval)s::interval
+                   AND event_type IN ('login_failure', 'login_locked')
+                   AND (%(username)s::text IS NULL OR username = %(username)s))
+            """,
+            params,
+        ).fetchone()
+        questions = conn.execute(
+            """
+            SELECT to_char(created_at_local, 'YYYY-MM-DD HH24:MI:SS'), coalesce(username, '(pre-accounts)'),
+                   question, status, latency_seconds, source_count, error
+            FROM v_query_activity
+            WHERE created_at > now() - %(interval)s::interval
+              AND (%(username)s::text IS NULL OR username = %(username)s)
+            ORDER BY created_at DESC
+            LIMIT """ + str(ACTIVITY_ROW_LIMIT),
+            params,
+        ).fetchall()
+        usage = conn.execute(
+            """
+            SELECT u.username, u.role, u.is_active,
+                   count(q.id) FILTER (WHERE q.created_at > now() - %(interval)s::interval),
+                   count(q.id) FILTER (WHERE q.created_at > now() - %(interval)s::interval AND q.status = 'error'),
+                   to_char(max(q.created_at) AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI'),
+                   to_char(u.last_login_at AT TIME ZONE 'America/New_York', 'YYYY-MM-DD HH24:MI')
+            FROM app_users u
+            LEFT JOIN queries q ON q.user_id = u.id
+            WHERE %(username)s::text IS NULL OR u.username = %(username)s
+            GROUP BY u.id
+            ORDER BY 4 DESC, u.username
+            """,
+            params,
+        ).fetchall()
+        security = conn.execute(
+            """
+            SELECT to_char(occurred_at_local, 'YYYY-MM-DD HH24:MI:SS'), event_type,
+                   coalesce(username, ''),
+                   CASE WHEN actor IS DISTINCT FROM username THEN coalesce(actor, '') ELSE '' END,
+                   coalesce(host(ip), ''), details
+            FROM v_security_events
+            WHERE occurred_at > now() - %(interval)s::interval
+              AND (%(username)s::text IS NULL OR username = %(username)s OR actor = %(username)s)
+            ORDER BY occurred_at DESC
+            LIMIT """ + str(ACTIVITY_ROW_LIMIT),
+            params,
+        ).fetchall()
+    return {"summary": summary, "questions": questions, "usage": usage, "security": security}
+
+
+def format_activity_summary(summary: tuple, range_label: str, username: str | None) -> str:
+    questions, users, errors, abandoned, limited, failed_logins = summary
+    scope = f"**{username}**" if username else "everyone"
+    return (
+        f"Last {range_label}, {scope}:\n\n"
+        "| Questions | Active users | Errors | Abandoned | Rate-limit hits | Failed sign-ins |\n"
+        "|---|---|---|---|---|---|\n"
+        f"| {questions} | {users} | {errors} | {abandoned} | {limited} | {failed_logins} |"
+    )
+
+
+def format_activity(data: dict) -> tuple[list, list, list]:
+    questions = [
+        [when, who, _clip(question, 200), status,
+         float(latency) if latency is not None else None, sources, _clip(error, 120)]
+        for when, who, question, status, latency, sources, error in data["questions"]
+    ]
+    usage = [
+        [username, role, "yes" if active else "no", count, errors, last_query or "—", last_login or "—"]
+        for username, role, active, count, errors, last_query, last_login in data["usage"]
+    ]
+    security = [
+        [when, event, who, by, ip, _clip(json.dumps(details, separators=(", ", ": ")) if details else "", 160)]
+        for when, event, who, by, ip, details in data["security"]
+    ]
+    return questions, usage, security
+
+
+def on_activity(range_label: str, username_filter: str, request: gr.Request):
+    require_admin(request, "activity")
+    username = None
+    if (username_filter or "").strip():
+        username = accounts.normalize_username(username_filter)
+        if username is None:
+            message = f"*'{username_filter.strip()}' isn't a valid username.*"
+            return message, [], [], []
+    data = fetch_activity(range_label, username)
+    questions, usage, security = format_activity(data)
+    return format_activity_summary(data["summary"], range_label, username), questions, usage, security
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
+
+def on_page_load(request: gr.Request):
+    """Banner for the signed-in account, and admin tabs shown only to admins."""
+    user = accounts.current_user(request)
+    is_admin = bool(user and user.is_admin)
+    if user is None:
+        banner = f"**{SESSION_ENDED}** [Sign out](/logout)"
+    else:
+        banner = (
+            f"Signed in as **{user.username}** ({user.email}) · {user.role} · [Sign out](/logout)"
+        )
+    return (banner,) + tuple(gr.update(visible=is_admin) for _ in range(4))
+
+
+def build_ui() -> gr.Blocks:
+    private = {"api_visibility": "private"}
 
     with gr.Blocks(title="HawkEye IT Assistant") as ui:
         gr.Markdown(
             "# HawkEye\nInternal IT help desk knowledge assistant — technicians only. "
             "Describe the customer's issue as you would to a coworker."
         )
+        session_banner = gr.Markdown("")
 
         with gr.Tabs():
             with gr.Tab("Assistant"):
@@ -309,18 +764,25 @@ def main():
                                 placeholder="e.g. customer can't connect to eduroam on their laptop",
                                 show_label=False,
                                 scale=5,
+                                max_length=MAX_QUESTION_CHARS,
                             )
                             send_button = gr.Button("Send", variant="primary", scale=1)
 
                     with gr.Column(scale=1):
                         context_markdown = gr.Markdown(
-                            value="*Retrieved context will appear here*",
+                            value=CONTEXT_PLACEHOLDER,
                             container=True,
                             height=420,
                         )
                         reset_button = gr.Button("New customer / reset chat", variant="secondary")
+                # Maps each assistant message's index in the chat to its queries.id,
+                # so a thumbs up/down can be filed against the question it rates.
+                query_ids = gr.State({})
 
-            with gr.Tab("Refresh History") as refresh_tab:
+            # Admin tabs start hidden and are revealed by on_page_load for admins,
+            # so a worker never sees them flash in. Hiding is cosmetic: the
+            # handlers below each check the role themselves.
+            with gr.Tab("Refresh History", visible=False) as refresh_tab:
                 gr.Markdown(
                     "Most recent knowledge-base refresh runs (weekly pipeline). Read-only."
                 )
@@ -335,66 +797,225 @@ def main():
                 refresh_runs_state = gr.State([])
                 refresh_runs_details = gr.Markdown(value=REFRESH_RUNS_DETAIL_PLACEHOLDER)
 
-            with gr.Tab("Knowledge Map") as kb_map_tab:
+            with gr.Tab("Knowledge Map", visible=False) as kb_map_tab:
                 gr.Markdown(
                     "3D map of every chunk in the knowledge base, colored by category."
                 )
                 kb_map_plot = gr.Plot()
 
-            refresh_runs_outputs = [
-                refresh_runs_table, refresh_runs_empty, refresh_runs_state, refresh_runs_details,
-            ]
-            refresh_tab.select(load_refresh_runs, inputs=None, outputs=refresh_runs_outputs)
-            refresh_runs_button.click(load_refresh_runs, inputs=None, outputs=refresh_runs_outputs)
-            refresh_runs_table.select(
-                show_run_details, inputs=refresh_runs_state, outputs=refresh_runs_details
-            )
+            with gr.Tab("Accounts", visible=False) as accounts_tab:
+                gr.Markdown(
+                    "Only accounts listed here can sign in. The username is the part of a New Paltz "
+                    "address before @newpaltz.edu. New workers sign in with the shared worker "
+                    "password and new admins with the admin password. Changing someone's role "
+                    "resets their password to the new role's default."
+                )
+                with gr.Row():
+                    new_username = gr.Textbox(
+                        label="Username", placeholder="e.g. khans45 or khans45@newpaltz.edu", scale=3,
+                    )
+                    new_role = gr.Radio(["worker", "admin"], value="worker", label="Role", scale=2)
+                    create_button = gr.Button("Create account", variant="primary", scale=1)
+                create_result = gr.Markdown("")
+                with gr.Accordion("Add several workers at once", open=False):
+                    bulk_text = gr.Textbox(
+                        label="One username or New Paltz address per line", lines=6,
+                    )
+                    bulk_button = gr.Button("Create worker accounts")
+                    bulk_result = gr.Markdown("")
 
-            kb_map_tab.select(load_kb_map, inputs=None, outputs=kb_map_plot)
+                gr.Markdown("### Accounts\nClick a row to pick that account below.")
+                users_table = gr.Dataframe(
+                    headers=USERS_HEADERS, datatype=USERS_DATATYPES, interactive=False, wrap=True,
+                )
+                with gr.Row():
+                    manage_username = gr.Dropdown(label="Account", choices=[], scale=2)
+                    disable_button = gr.Button("Disable", variant="stop", scale=1)
+                    enable_button = gr.Button("Enable", scale=1)
+                    make_admin_button = gr.Button("Make admin", scale=1)
+                    make_worker_button = gr.Button("Make worker", scale=1)
+                    reset_password_button = gr.Button("Reset password", scale=1)
+                manage_result = gr.Markdown("")
+                users_refresh_button = gr.Button("Refresh list", size="sm")
 
-        def put_message_in_chatbot(msg, hist):
-            return "", hist + [{"role": "user", "content": msg}]
+            with gr.Tab("Activity", visible=False) as activity_tab:
+                with gr.Row():
+                    activity_range = gr.Radio(
+                        list(ACTIVITY_RANGES), value="24 hours", label="Time range", scale=2,
+                    )
+                    activity_user = gr.Textbox(
+                        label="Username (blank for everyone)", placeholder="e.g. khans45", scale=2,
+                    )
+                    activity_button = gr.Button("Refresh", variant="primary", scale=1)
+                activity_summary = gr.Markdown("")
+                gr.Markdown("### Questions")
+                activity_questions = gr.Dataframe(
+                    headers=ACTIVITY_QUERY_HEADERS, interactive=False, wrap=True,
+                )
+                gr.Markdown("### Usage by account")
+                activity_usage = gr.Dataframe(headers=ACTIVITY_USAGE_HEADERS, interactive=False)
+                gr.Markdown("### Sign-ins, lockouts, rate limits, account changes")
+                activity_security = gr.Dataframe(
+                    headers=ACTIVITY_SECURITY_HEADERS, interactive=False, wrap=True,
+                )
 
-        def respond(hist):
-            hist = normalize_history(hist)
-            last_message = hist[-1]["content"]
-            prior = hist[:-1]
-            hist.append({"role": "assistant", "content": "_Searching the knowledge base…_"})
-            yield hist, "*Retrieving context…*"
-            for partial_answer, context in chat_stream(last_message, prior):
-                hist[-1]["content"] = partial_answer
-                yield hist, context
+        # --- Wiring -----------------------------------------------------------
 
-        message.submit(
-            put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]
-        ).then(respond, inputs=chatbot, outputs=[chatbot, context_markdown])
+        admin_tabs = [refresh_tab, kb_map_tab, accounts_tab, activity_tab]
+        ui.load(on_page_load, inputs=None, outputs=[session_banner, *admin_tabs], **private)
 
-        send_button.click(
-            put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot]
-        ).then(respond, inputs=chatbot, outputs=[chatbot, context_markdown])
-
-        def reset_chat():
-            return [], "*Retrieved context will appear here*", ""
-
-        reset_button.click(
-            reset_chat, inputs=None, outputs=[chatbot, context_markdown, message]
+        refresh_runs_outputs = [
+            refresh_runs_table, refresh_runs_empty, refresh_runs_state, refresh_runs_details,
+        ]
+        refresh_tab.select(on_refresh_history, inputs=None, outputs=refresh_runs_outputs, **private)
+        refresh_runs_button.click(on_refresh_history, inputs=None, outputs=refresh_runs_outputs, **private)
+        refresh_runs_table.select(
+            on_run_selected, inputs=refresh_runs_state, outputs=refresh_runs_details, **private
         )
 
-        def on_like(evt: gr.LikeData):
-            # Gradio's LikeData gives us the message content and whether it was
-            # liked/disliked, but not the question that produced it — good enough
-            # for a first pass at "is this answer any good" signal.
-            log_feedback(answer=str(evt.value), liked=bool(evt.liked))
+        kb_map_tab.select(on_kb_map, inputs=None, outputs=kb_map_plot, **private)
 
-        chatbot.like(on_like)
+        users_outputs_list = [users_table, manage_username]
+        accounts_tab.select(on_accounts_tab, inputs=None, outputs=users_outputs_list, **private)
+        users_refresh_button.click(on_accounts_tab, inputs=None, outputs=users_outputs_list, **private)
+        create_button.click(
+            on_create_account, inputs=[new_username, new_role],
+            outputs=[create_result, *users_outputs_list, new_username], **private,
+        )
+        bulk_button.click(
+            on_bulk_create, inputs=bulk_text, outputs=[bulk_result, *users_outputs_list], **private,
+        )
+        for button, action in (
+            (disable_button, "disable"), (enable_button, "enable"),
+            (make_admin_button, "admin"), (make_worker_button, "worker"),
+            (reset_password_button, "reset"),
+        ):
+            button.click(
+                manage_handler(action), inputs=manage_username,
+                outputs=[manage_result, *users_outputs_list], **private,
+            )
+        users_table.select(on_user_row_selected, inputs=None, outputs=manage_username, **private)
 
-    ui.launch(
-        theme=theme,
-        auth=[(username, password)],
-        server_name="0.0.0.0",
-        server_port=int(os.getenv("PORT", 7860)),
-        favicon_path=FAVICON,
+        activity_outputs = [activity_summary, activity_questions, activity_usage, activity_security]
+        activity_inputs = [activity_range, activity_user]
+        activity_tab.select(on_activity, inputs=activity_inputs, outputs=activity_outputs, **private)
+        activity_button.click(on_activity, inputs=activity_inputs, outputs=activity_outputs, **private)
+        activity_user.submit(on_activity, inputs=activity_inputs, outputs=activity_outputs, **private)
+
+        respond_outputs = [chatbot, context_markdown, query_ids]
+        message.submit(
+            put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot], **private
+        ).then(respond, inputs=[chatbot, query_ids], outputs=respond_outputs, **private)
+        send_button.click(
+            put_message_in_chatbot, inputs=[message, chatbot], outputs=[message, chatbot], **private
+        ).then(respond, inputs=[chatbot, query_ids], outputs=respond_outputs, **private)
+
+        def reset_chat():
+            return [], CONTEXT_PLACEHOLDER, "", {}
+
+        reset_button.click(
+            reset_chat, inputs=None, outputs=[chatbot, context_markdown, message, query_ids], **private
+        )
+
+        chatbot.like(on_like, inputs=query_ids, outputs=None, **private)
+
+    return ui
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
+class ClientContextMiddleware:
+    """
+    Runs in front of Gradio on every HTTP request. Records the real client IP and
+    user agent for the audit log (Gradio's login hook only gets a username and
+    password), and turns away a single IP's sign-in flood with a 429 before any
+    password is hashed or database row touched. Pure ASGI rather than
+    BaseHTTPMiddleware so Gradio's streaming responses pass through untouched.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        peer = scope["client"][0] if scope.get("client") else None
+        ip = audit.resolve_client_ip(headers, peer)
+        ip_token = audit.client_ip.set(ip)
+        agent_token = audit.user_agent.set(headers.get("user-agent"))
+        try:
+            if scope["method"] == "POST" and scope["path"].rstrip("/").endswith("/login"):
+                retry = rate_limit.login_ip_limiter.hit(ip or "unknown")
+                if retry is not None:
+                    if rate_limit.audit_noise_limiter.hit(("login_ip", ip)) is None:
+                        await anyio.to_thread.run_sync(
+                            lambda: audit.record_event(
+                                "rate_limited", ip=ip, agent=headers.get("user-agent"),
+                                details={"scope": "login_ip", "retry_after_seconds": int(retry) + 1},
+                            )
+                        )
+                    response = JSONResponse(
+                        {"detail": "Too many sign-in attempts from your network. "
+                                   f"Try again in {rate_limit.format_wait(retry)}."},
+                        status_code=429,
+                        headers={"Retry-After": str(int(retry) + 1)},
+                    )
+                    await response(scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
+        finally:
+            audit.client_ip.reset(ip_token)
+            audit.user_agent.reset(agent_token)
+
+
+def check_startup() -> None:
+    """Fail fast on missing secrets; warn loudly if nobody could manage accounts."""
+    accounts.require_default_passwords()
+    try:
+        if not accounts.has_active_admin():
+            log.warning(
+                "No active admin account exists, so nobody can create accounts. Run "
+                "`uv run python scripts/manage_users.py bootstrap <username>`."
+            )
+    except Exception:
+        log.warning("Couldn't check for an admin account at startup.", exc_info=True)
+
+
+def build_app() -> FastAPI:
+    theme = gr.themes.Soft(
+        primary_hue="blue", secondary_hue="slate", font=["Inter", "system-ui", "sans-serif"]
     )
+    ui = build_ui()
+    # Four answers stream at once at most (the database pool holds five
+    # connections), and at most 50 events wait in line before new ones are refused.
+    ui.queue(default_concurrency_limit=4, max_size=50)
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(ClientContextMiddleware)
+    return gr.mount_gradio_app(
+        app,
+        ui,
+        path="/",
+        auth=accounts.authenticate,
+        auth_message=(
+            "Sign in with your New Paltz username (the part of your email before "
+            "@newpaltz.edu). Accounts are created by HawkEye admins."
+        ),
+        theme=theme,
+        favicon_path=FAVICON,
+        allowed_paths=["static"],
+        footer_links=["gradio", "settings"],
+    )
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    check_startup()
+    uvicorn.run(build_app(), host="0.0.0.0", port=int(os.getenv("PORT", 7860)))
 
 
 if __name__ == "__main__":

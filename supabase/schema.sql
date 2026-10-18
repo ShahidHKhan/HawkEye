@@ -10,6 +10,11 @@
 -- Treat this file as documentation of what exists, kept idempotent (safe to
 -- run against a fresh database) but not guaranteed to match reality unless
 -- someone re-reconciles it the same way in the future.
+--
+-- 2026-10-18: updated by hand for supabase/migrations/2026-10-18_accounts.sql
+-- (app_users, audit_events, the user/status columns on queries and feedback,
+-- the monitoring views, and RLS on every table). That migration file is what
+-- actually changes a live database; this file only mirrors the result.
 
 create extension if not exists vector;
 
@@ -57,23 +62,74 @@ create index if not exists chunks_article_id_idx
 -- create index chunks_embedding_idx
 --     on chunks using ivfflat (embedding vector_l2_ops) with (lists = 100);
 
+-- One row per technician. See implementation/accounts.py and the migration
+-- for the reasoning behind each column.
+create table if not exists app_users (
+    id bigserial primary key,
+    username text not null unique
+        check (username ~ '^[a-z0-9][a-z0-9._-]{1,31}$'),
+    email text generated always as (username || '@newpaltz.edu') stored,
+    role text not null default 'worker'
+        check (role in ('admin', 'worker')),
+    password_hash text not null,
+    is_active boolean not null default true,
+    must_change_password boolean not null default true,
+    created_at timestamptz not null default now(),
+    created_by bigint references app_users(id) on delete set null,
+    last_login_at timestamptz
+);
+
+-- Inserted when a question starts (status 'in_progress') and updated when it
+-- ends; the per-user rate limiter counts these rows. user_id is null for rows
+-- from before accounts existed.
 create table if not exists queries (
     id bigserial primary key,
     question text not null,
-    history_length integer not null,
+    history_length integer,
     answer text,
     sources jsonb,
     latency_seconds numeric,
     error text,
-    created_at timestamptz default now()
+    created_at timestamptz default now(),
+    user_id bigint references app_users(id) on delete set null,
+    status text not null default 'completed'
+        check (status in ('in_progress', 'completed', 'error', 'abandoned')),
+    session_id text
 );
+
+create index if not exists queries_user_created_idx
+    on queries (user_id, created_at desc);
+create index if not exists queries_created_at_idx
+    on queries (created_at);
 
 create table if not exists feedback (
     id bigserial primary key,
     answer text,
     liked boolean,
-    created_at timestamptz default now()
+    created_at timestamptz default now(),
+    user_id bigint references app_users(id) on delete set null,
+    query_id bigint references queries(id) on delete set null
 );
+
+-- Append-only log of sign-ins, lockouts, rate-limit hits, refused admin
+-- access, and account changes. username_attempted is the name typed at the
+-- login form, or the account acted on for admin actions (user_id is then the
+-- acting admin).
+create table if not exists audit_events (
+    id bigserial primary key,
+    occurred_at timestamptz not null default now(),
+    event_type text not null,
+    user_id bigint references app_users(id) on delete set null,
+    username_attempted text,
+    ip inet,
+    user_agent text,
+    details jsonb
+);
+
+create index if not exists audit_events_type_username_idx
+    on audit_events (event_type, username_attempted, occurred_at desc);
+create index if not exists audit_events_occurred_idx
+    on audit_events (occurred_at desc);
 
 -- One row per known KB article, keyed by its TeamDynamix article id. Written
 -- and read by refresh_kb.py's diff-based refresh: implementation/diff_articles.py
@@ -117,13 +173,21 @@ create table if not exists refresh_runs (
     changes jsonb
 );
 
--- Row Level Security is enabled (Supabase's default for dashboard-created
--- tables) on chunks, queries, and feedback, but not on article_state or
--- refresh_runs -- inconsistent, and there are currently zero policies defined
--- on any of the five tables. The app always connects as the postgres role
--- (table owner), which bypasses RLS by default, so this has no practical
--- effect today; it would matter if a lower-privileged role (e.g. Supabase's
--- anon/authenticated roles) were ever used against these tables directly.
+-- Monitoring views: v_query_activity (who asked what, when),
+-- v_user_usage (per-account totals), v_security_events (readable audit log).
+-- Defined in supabase/migrations/2026-10-18_accounts.sql, with
+-- security_invoker = true and no privileges for anon/authenticated.
+
+-- Row Level Security is enabled with zero policies on every table, which denies
+-- all access through Supabase's REST API (anon/authenticated roles). That
+-- matters most for app_users, which holds password hashes. The app and
+-- refresh_kb.py connect as postgres, which has BYPASSRLS, so they're unaffected.
+-- (Before 2026-10-18, article_state and refresh_runs were the two tables
+-- without RLS.)
 alter table chunks enable row level security;
 alter table queries enable row level security;
 alter table feedback enable row level security;
+alter table article_state enable row level security;
+alter table refresh_runs enable row level security;
+alter table app_users enable row level security;
+alter table audit_events enable row level security;

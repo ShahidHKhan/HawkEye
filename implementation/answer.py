@@ -1,9 +1,6 @@
-import os
-
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -17,16 +14,10 @@ FINAL_K = 5
 
 wait = wait_exponential(multiplier=1, min=10, max=240)
 
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
-if not SUPABASE_DB_URL:
-    raise RuntimeError("SUPABASE_DB_URL not set — add it to your .env file")
-
-db_pool = ConnectionPool(
-    SUPABASE_DB_URL,
-    min_size=1,
-    max_size=5,
-    check=ConnectionPool.check_connection,
-)
+# The pool lives in implementation/db.py so account/audit code can reach the
+# database without importing this module's Gemini client. Re-exported here
+# because app.py has always imported it from here.
+from implementation.db import db_pool  # noqa: E402
 
 embeddings_model = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 # Same reasoning as ingest.py: the @retry decorators below own retrying, so the

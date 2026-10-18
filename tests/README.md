@@ -1,8 +1,10 @@
 # Tests
 
 ```
-python tests/test_refresh_kb.py     # 15 offline tests
-python tests/test_app.py            # 11 offline tests
+python tests/test_refresh_kb.py     # 19 offline tests
+python tests/test_app.py            # 24 offline tests
+python tests/test_accounts.py       # 24 offline tests
+python tests/test_rate_limit.py     # 18 offline tests
 python tests/check_live_state.py    # read-only audit of the live database
 ```
 
@@ -44,6 +46,21 @@ The rest of that file covers the pieces that were easy to get wrong:
 `test_app.py` covers the Refresh History tab's detail panel, including the
 distinction between a run that processed nothing because nothing had changed and
 one that processed nothing because it crashed.
+
+`test_app.py` also covers accounts in the app: every admin handler refuses a
+worker and a signed-out request (tabs are hidden from workers, but the handlers
+are reachable directly), and the question flow logs a question when it starts
+and records how it ended, including **abandoned** when the stream is closed
+mid-answer. It also checks that a second question is refused while one is
+still streaming, and that a rate-limited question never reaches the model.
+
+`test_accounts.py` covers username normalization (case, whitespace, the full
+`@newpaltz.edu` address, other domains rejected), argon2 hashing, the refusal to
+start with missing or equal default passwords, the admin guardrails (no
+self-disable or self-demotion, never zero admins), bulk creation, and that a
+session's username is normalized on every lookup. `test_rate_limit.py` drives
+the sliding window, the one-question-at-a-time guard, and the quota decision
+with a fake clock.
 
 ## check_live_state.py
 
