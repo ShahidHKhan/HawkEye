@@ -1,0 +1,28 @@
+name: Uptime check
+
+# Polls production's /healthz (which runs SELECT 1 through the app's own pool)
+# and fails when it doesn't answer 200. GitHub emails a failed scheduled run to
+# whoever last changed this file's cron line, which is the alert. Added after
+# 2026-10-26, when Fly lost its connection to the database and nobody knew until
+# technicians couldn't sign in.
+#
+# GitHub may start a scheduled run several minutes late, and it pauses schedules
+# in a repo with no commits for 60 days (re-enable from the Actions tab).
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  healthz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Retries ride out a restart or deploy (about a minute) so only a real
+      # outage turns into an email.
+      - name: GET /healthz
+        run: |
+          curl --fail-with-body --silent --show-error --max-time 20 \
+            --retry 3 --retry-delay 20 --retry-all-errors \
+            https://hawkeye-newpaltz.fly.dev/healthz

@@ -193,6 +193,23 @@ restarts the running machine:
 fly secrets unset APP_USERNAME APP_PASSWORD
 ```
 
+### Health check and alert
+
+`GET /healthz` returns `{"status": "ok"}` (200) when a `SELECT 1` through the
+app's own pool succeeds, and 503 when it doesn't. It needs no sign-in, and one
+probe answers for 10 seconds, so polling it can't tie up the pool.
+
+- `fly.toml` runs it every 30 seconds as a Fly machine check, shown in the
+  dashboard and in `fly checks list`. It doesn't affect routing. `fly deploy`
+  waits on it, so a deploy that can't reach the database is reported as failed.
+- `.github/workflows/uptime.yml` polls it every 15 minutes. A failed run is
+  emailed by GitHub to whoever last changed that file's schedule.
+
+Production's `SUPABASE_DB_URL` uses Supabase's direct host
+(`db.<project-ref>.supabase.co`, user `postgres`), not the session pooler in
+`.env.example`. On 2026-10-26 the Fly machine stopped being able to reach the
+pooler, while the same URL kept working everywhere else.
+
 ## Repo layout
 
 - `app.py` — Gradio chat UI (production entry point)

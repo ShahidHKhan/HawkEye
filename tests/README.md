@@ -2,7 +2,7 @@
 
 ```
 python tests/test_refresh_kb.py     # 19 offline tests
-python tests/test_app.py            # 24 offline tests
+python tests/test_app.py            # 28 offline tests
 python tests/test_accounts.py       # 24 offline tests
 python tests/test_rate_limit.py     # 18 offline tests
 python tests/check_live_state.py    # read-only audit of the live database

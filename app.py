@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import closing
 
@@ -972,6 +973,43 @@ class ClientContextMiddleware:
             audit.user_agent.reset(agent_token)
 
 
+# How long one database probe answers /healthz for. The route is unauthenticated
+# (Fly's checker and the uptime workflow can't sign in), so without this anyone
+# polling it could keep the pool's five connections busy.
+HEALTH_CACHE_SECONDS = 10
+_health = {"checked_at": None, "ok": False}
+_health_lock = threading.Lock()
+
+
+def database_reachable() -> bool:
+    """
+    SELECT 1 through the app's own pool, so it fails exactly when sign-ins and
+    questions would. On 2026-10-26 the pooler stopped accepting connections from
+    Fly and the app kept serving the login page -- nothing noticed until people
+    couldn't sign in. Concurrent callers wait on the lock and share one probe.
+    """
+    with _health_lock:
+        checked_at = _health["checked_at"]
+        if checked_at is not None and time.monotonic() - checked_at < HEALTH_CACHE_SECONDS:
+            return _health["ok"]
+        try:
+            with db_pool.connection(timeout=5) as conn:
+                conn.execute("SELECT 1")
+            ok = True
+        except Exception as e:
+            log.warning("Health check: database unreachable (%s: %s)", type(e).__name__, e)
+            ok = False
+        _health.update(checked_at=time.monotonic(), ok=ok)
+        return ok
+
+
+def healthz() -> JSONResponse:
+    """GET /healthz: 200 if the database answers, 503 if not. No details beyond that."""
+    if database_reachable():
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "database unreachable"}, status_code=503)
+
+
 def check_startup() -> None:
     """Fail fast on missing secrets; warn loudly if nobody could manage accounts."""
     accounts.require_default_passwords()
@@ -996,6 +1034,10 @@ def build_app() -> FastAPI:
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(ClientContextMiddleware)
+    # Registered before the Gradio mount so it's matched first and sits outside
+    # Gradio's sign-in. A plain def, so FastAPI runs the database probe on its
+    # thread pool rather than the event loop.
+    app.add_api_route("/healthz", healthz, methods=["GET"], include_in_schema=False)
     return gr.mount_gradio_app(
         app,
         ui,

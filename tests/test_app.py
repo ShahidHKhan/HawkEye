@@ -359,5 +359,81 @@ def test_activity_summary_names_its_scope():
     assert "**jdoe12**" in app.format_activity_summary((3, 1, 0, 0, 0, 0), "7 days", "jdoe12")
 
 
+# --- /healthz ----------------------------------------------------------------------
+
+from contextlib import contextmanager  # noqa: E402
+
+
+class FakePool:
+    """Stands in for db_pool: counts probes, and can fail the way an unreachable database does."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.probes = 0
+
+    @contextmanager
+    def connection(self, timeout=None):
+        self.probes += 1
+        if self.fail:
+            raise TimeoutError("couldn't get a connection after 5.00 sec")
+        yield type("FakeConn", (), {"execute": lambda self, sql: None})()
+
+
+def health_stubs(pool):
+    stubs = Stubs()
+    stubs.set(app, "db_pool", pool)
+    app._health.update(checked_at=None, ok=False)
+    return stubs
+
+
+def test_healthz_is_ok_when_the_database_answers():
+    stubs = health_stubs(FakePool())
+    try:
+        response = app.healthz()
+    finally:
+        stubs.restore()
+    assert response.status_code == 200
+    assert response.body == b'{"status":"ok"}'
+
+
+def test_healthz_is_503_when_the_database_is_unreachable():
+    """The 2026-10-26 outage: every pool checkout timed out while the page still loaded."""
+    stubs = health_stubs(FakePool(fail=True))
+    try:
+        response = app.healthz()
+    finally:
+        stubs.restore()
+    assert response.status_code == 503
+    assert b"5.00 sec" not in response.body, "no error details to an unauthenticated caller"
+
+
+def test_healthz_probes_at_most_once_per_cache_window():
+    pool = FakePool()
+    stubs = health_stubs(pool)
+    try:
+        for _ in range(20):
+            app.healthz()
+        assert pool.probes == 1
+        app._health["checked_at"] -= app.HEALTH_CACHE_SECONDS
+        app.healthz()
+        assert pool.probes == 2
+    finally:
+        stubs.restore()
+
+
+def test_healthz_is_served_without_signing_in():
+    """Fly's checker and the uptime workflow have no account; the route must sit outside Gradio's auth."""
+    from fastapi.testclient import TestClient
+
+    stubs = health_stubs(FakePool())
+    try:
+        with TestClient(app.build_app()) as client:
+            response = client.get("/healthz")
+    finally:
+        stubs.restore()
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 if __name__ == "__main__":
     sys.exit(run_tests(dict(globals())))

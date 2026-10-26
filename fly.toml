@@ -25,6 +25,22 @@ primary_region = 'yyz'
     soft_limit = 50
     hard_limit = 100
 
+# Database health, shown in the dashboard and `fly checks list`. Top-level rather
+# than under [http_service] on purpose: a failing service check takes the machine
+# out of routing, and with one machine that would replace HawkEye's own error
+# messages with a proxy error. `fly deploy` also waits on it, so a deploy that
+# can't reach Supabase (a bad SUPABASE_DB_URL) is reported as failed instead of
+# looking fine. The alert itself is .github/workflows/uptime.yml.
+[checks]
+  [checks.database]
+    type = 'http'
+    port = 7860
+    method = 'get'
+    path = '/healthz'
+    interval = '30s'
+    timeout = '10s'
+    grace_period = '60s'
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
